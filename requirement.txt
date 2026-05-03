@@ -3,3 +3,4 @@ scipy
 matplotlib
 opencv-python
 pillow
+cupy
