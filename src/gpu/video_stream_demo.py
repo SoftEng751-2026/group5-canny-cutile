@@ -3,6 +3,8 @@ import csv
 import time
 from pathlib import Path
 
+from paths import resolve_project_path
+
 import cv2
 import cupy as cp
 import numpy as np
@@ -346,6 +348,15 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if args.image_loop is not None:
+        args.image_loop = resolve_project_path(args.image_loop)
+
+    if args.output_video is not None:
+        args.output_video = resolve_project_path(args.output_video)
+
+    if args.results_csv is not None:
+        args.results_csv = resolve_project_path(args.results_csv)
+
     if args.max_frames < 0:
         raise ValueError("max-frames must be >= 0")
 
@@ -358,7 +369,7 @@ def main():
 
     if args.results_csv is None:
         sigma_text = f"{args.sigma:g}".replace(".", "p")
-        args.results_csv = (
+        args.results_csv = resolve_project_path(
             Path("report")
             / f"25_video_stream_fps_{source_tag}_tile{args.tile_size}_k{args.kernel_size}_s{sigma_text}.csv"
         )

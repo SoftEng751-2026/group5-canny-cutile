@@ -1,6 +1,7 @@
 import argparse
 import time
 from pathlib import Path
+from paths import resolve_project_path
 
 import cv2
 import cupy as cp
@@ -251,8 +252,8 @@ def main():
     if args.warmup < 0:
         raise ValueError("warmup must not be negative.")
 
-    image_path = args.image.resolve()
-    output_dir = args.output_dir.resolve()
+    image_path = resolve_project_path(args.image)
+    output_dir = resolve_project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_cpu = load_grayscale_image(image_path)
