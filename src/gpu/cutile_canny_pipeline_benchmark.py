@@ -14,7 +14,7 @@ from gaussian_benchmark import (
     make_gaussian_kernel,
 )
 from sobel_benchmark import normalize_to_uint8, sobel_cpu
-from sobel_cutile_benchmark import launch_sobel_cutile
+from sobel_cutile_benchmark import sobel_magnitude_cupy_compute_only
 
 
 def sobel_angle_cupy_compute_only(image_gpu):
@@ -161,10 +161,7 @@ def canny_pipeline_gpu_compute_only(image_gpu, kernel_gpu, tile_size: int):
     """
     blurred_gpu = gaussian_blur_gpu_compute_only(image_gpu, kernel_gpu)
 
-    magnitude_gpu = launch_sobel_cutile(
-        image_gpu=blurred_gpu,
-        tile_size=tile_size,
-    )
+    magnitude_gpu = sobel_magnitude_cupy_compute_only(blurred_gpu)
 
     angle_gpu = sobel_angle_cupy_compute_only(blurred_gpu)
 
@@ -590,3 +587,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
