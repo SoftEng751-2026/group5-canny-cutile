@@ -19,7 +19,7 @@ Canny Edge Detection implementation with cuTile for SoftEng 751 2026
 .venv\Scripts\activate
 
 # 2. 安装依赖
-pip install -r requirements.txt
+pip install -r requirement.txt
 
 # 3. 运行 Jupyter Notebook
 jupyter notebook
@@ -88,10 +88,36 @@ python src/gpu/video_stream_demo.py --source 0
 # Video demo using a static image as a fake stream (no webcam needed)
 python src/gpu/video_stream_demo.py --image-loop data/test.jpg --max-frames 30 --no-display
 
+# Experimental pipeline-parallel video demo
+python src/gpu/video_stream_pipeline_demo.py --source 0 --max-frames 100 --resize-width 512 --tile-size 256 --results-csv report/video_pipeline_camera_test.csv
+
+# Repeatable image-loop test for the pipelined video demo
+python src/gpu/video_stream_pipeline_demo.py --image-loop data/IMG_6860.JPG --max-frames 30 --resize-width 512 --tile-size 256 --no-display --results-csv report/video_pipeline_test.csv
+
 # Individual stage benchmarks
 python src/gpu/sobel_cutile_benchmark.py --tile-sizes 64,128,256,512 --runs 30
 python src/gpu/complete_canny_benchmark.py --image data/test.jpg
 ```
+
+
+## Experimental Pipeline-Parallel Video Demo
+
+`src/gpu/video_stream_pipeline_demo.py` explores pipeline parallelism across video frames. The original `video_stream_demo.py` processes one frame through the full Canny pipeline before moving to the next frame. The pipelined version separates the work into three stages:
+
+1. Producer: reads frames from a camera, video file, or image loop.
+2. GPU worker: performs resize, grayscale conversion, Gaussian blur, Sobel gradient, and NMS.
+3. CPU post-processing: performs double thresholding, hysteresis, display, and optional video writing.
+
+This allows the GPU frontend for frame N+1 to overlap with CPU thresholding and hysteresis for frame N. This is pipeline parallelism across frames, while the Gaussian/Sobel/NMS stages still use data parallelism within each frame.
+
+Example results on our test machine:
+
+| Test | Result |
+|---|---|
+| Sequential image-loop demo, 30 frames | 9.36 FPS |
+| Pipelined image-loop demo, 30 frames | 39.57 throughput FPS |
+| Pipelined camera demo, 100 frames | 22.79 throughput FPS |
+
 
 ## cuTile Implementation Details
 
