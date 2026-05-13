@@ -14,6 +14,8 @@ import cv2
 import kagglehub
 import matplotlib.pyplot as plt
 import numpy as np
+import csv
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +138,7 @@ def _download_bsds500() -> Path:
     return Path(path)
 
 
-def _find_test_images(root: Path, max_images: int) -> list[Path]:
+def _find_test_images(root: Path, max_images: int = None) -> list[Path]:
     # Try known sub-paths for the standard BSDS500 Kaggle layout
     candidates = [
         "BSR/BSDS500/data/images/test",
@@ -148,12 +150,16 @@ def _find_test_images(root: Path, max_images: int) -> list[Path]:
     for sub in candidates:
         folder = root / sub
         if folder.is_dir():
-            imgs = sorted(folder.glob("*.jpg"))[:max_images]
+            imgs = sorted(folder.glob("*.jpg"))
+            if max_images:
+                imgs = imgs[:max_images]
             if imgs:
                 print(f"Images found at: {folder}")
                 return imgs
     # Fallback: any JPEG in the tree
-    imgs = sorted(root.rglob("*.jpg"))[:max_images]
+    imgs = sorted(root.rglob("*.jpg"))
+    if max_images:
+        imgs = imgs[:max_images]
     if imgs:
         print("Images found via recursive search.")
     return imgs
@@ -257,7 +263,7 @@ def _print_summary(records: list[dict]) -> None:
     print(f"{'Image':<30} {'Agreement':>10} {'Precision':>10} {'Recall':>10} {'F1':>8}")
     print("-" * 76)
 
-    agreements, f1s = [], []
+    agreements, precisions, recalls, f1s = [], [], [], []
     for rec in records:
         m = rec["metrics"]
         name = rec["name"][:28]
@@ -266,12 +272,26 @@ def _print_summary(records: list[dict]) -> None:
             f" {m['precision']:>10.3f} {m['recall']:>10.3f} {m['f1']:>8.3f}"
         )
         agreements.append(m["agreement"])
+        precisions.append(m["precision"])
+        recalls.append(m["recall"])
         f1s.append(m["f1"])
 
     print("-" * 76)
     print(
         f"{'MEAN':<30} {np.mean(agreements)*100:>9.2f}%"
-        f" {'':>10} {'':>10} {np.mean(f1s):>8.3f}"
+        f" {np.mean(precisions):>10.3f} {np.mean(recalls):>10.3f} {np.mean(f1s):>8.3f}"
+    )
+    print(
+        f"{'STDEV':<30} {np.std(agreements)*100:>9.2f}%"
+        f" {np.std(precisions):>10.3f} {np.std(recalls):>10.3f} {np.std(f1s):>8.3f}"
+    )
+    print(
+        f"{'MIN':<30} {np.min(agreements)*100:>9.2f}%"
+        f" {np.min(precisions):>10.3f} {np.min(recalls):>10.3f} {np.min(f1s):>8.3f}"
+    )
+    print(
+        f"{'MAX':<30} {np.max(agreements)*100:>9.2f}%"
+        f" {np.max(precisions):>10.3f} {np.max(recalls):>10.3f} {np.max(f1s):>8.3f}"
     )
     print(sep)
     print(
@@ -285,13 +305,76 @@ def _print_summary(records: list[dict]) -> None:
         "  * OpenCV computes Sobel on uint8 internally before converting to float\n"
         "  * Minor floating-point ordering differences in NMS\n"
     )
+    
+    # Save results to CSV
+    csv_path = Path("canny_reliability_results.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Image", "Agreement", "Precision", "Recall", "F1"])
+        for rec in records:
+            m = rec["metrics"]
+            writer.writerow([
+                rec["name"],
+                f"{m['agreement']:.6f}",
+                f"{m['precision']:.6f}",
+                f"{m['recall']:.6f}",
+                f"{m['f1']:.6f}",
+            ])
+        writer.writerow([])  # blank line
+        writer.writerow(["AGGREGATED STATISTICS"])
+        writer.writerow(["Metric", "Mean", "Stdev", "Min", "Max", "Count"])
+        writer.writerow([
+            "Agreement",
+            f"{np.mean(agreements):.6f}",
+            f"{np.std(agreements):.6f}",
+            f"{np.min(agreements):.6f}",
+            f"{np.max(agreements):.6f}",
+            len(agreements),
+        ])
+        writer.writerow([
+            "Precision",
+            f"{np.mean(precisions):.6f}",
+            f"{np.std(precisions):.6f}",
+            f"{np.min(precisions):.6f}",
+            f"{np.max(precisions):.6f}",
+            len(precisions),
+        ])
+        writer.writerow([
+            "Recall",
+            f"{np.mean(recalls):.6f}",
+            f"{np.std(recalls):.6f}",
+            f"{np.min(recalls):.6f}",
+            f"{np.max(recalls):.6f}",
+            len(recalls),
+        ])
+        writer.writerow([
+            "F1",
+            f"{np.mean(f1s):.6f}",
+            f"{np.std(f1s):.6f}",
+            f"{np.min(f1s):.6f}",
+            f"{np.max(f1s):.6f}",
+            len(f1s),
+        ])
+    
+    print(f"\n✓ 详细结果已保存至: {csv_path.absolute()}")
+    return {
+        "mean_agreement": np.mean(agreements),
+        "mean_precision": np.mean(precisions),
+        "mean_recall": np.mean(recalls),
+        "mean_f1": np.mean(f1s),
+        "std_agreement": np.std(agreements),
+        "std_precision": np.std(precisions),
+        "std_recall": np.std(recalls),
+        "std_f1": np.std(f1s),
+        "count": len(records),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main(max_images: int = 5, kernel_size: int = 5, sigma: float = 1.4,
+def main(max_images: int = None, kernel_size: int = 5, sigma: float = 1.4,
          high_percentile: float = 90.0, low_ratio: float = 0.5) -> None:
 
     dataset_root = _download_bsds500()
@@ -301,13 +384,15 @@ def main(max_images: int = 5, kernel_size: int = 5, sigma: float = 1.4,
         print("ERROR: no JPEG images found in the downloaded dataset.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nTesting on {len(image_paths)} image(s). Parameters: "
-          f"kernel={kernel_size}, sigma={sigma}, "
+    max_display = 5  # Only display first 5 images to avoid too many plots
+    print(f"\nTesting on {len(image_paths)} image(s).\n")
+    print(f"Parameters: kernel={kernel_size}, sigma={sigma}, "
           f"high_pct={high_percentile}, low_ratio={low_ratio}\n")
+    print(f"Note: Full grid visualization will show first {max_display} images only.\n")
 
     records = []
-    for img_path in image_paths:
-        print(f"  {img_path.name} ...", end=" ", flush=True)
+    for idx, img_path in enumerate(image_paths):
+        print(f"  [{idx+1}/{len(image_paths)}] {img_path.name} ...", end=" ", flush=True)
 
         gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
         if gray is None:
@@ -357,8 +442,11 @@ def main(max_images: int = 5, kernel_size: int = 5, sigma: float = 1.4,
         print("No images could be processed.", file=sys.stderr)
         sys.exit(1)
 
-    _print_summary(records)
-    _show_grid(records)
+    summary = _print_summary(records)
+    
+    # Only display the first max_display images
+    display_records = records[:max_display]
+    _show_grid(display_records)
 
 
 if __name__ == "__main__":
