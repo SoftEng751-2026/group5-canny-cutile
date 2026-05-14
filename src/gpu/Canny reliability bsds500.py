@@ -233,57 +233,80 @@ def _show_grid(records: list[dict], title_suffix: str = "",
     """
     Display a clean grid of results.
 
-    Each image is resized to (thumb_h × thumb_w) — 3:2 landscape ratio —
-    which matches the typical BSDS500 image aspect ratio and avoids distortion.
-    Stats are rendered as xlabel (not overlaid text) with enough row padding
-    so they never overlap the next row's image.
+    Layout uses n+2 rows in GridSpec:
+      row 0  — title + legend (text-only, tall)
+      row 1  — column headers (text-only, short)
+      rows 2+ — image data rows
+    This ensures title, legend and column headers never overlap.
     """
     n = len(records)
 
-    # Figure dimensions
-    DPI = 100
-    label_px = 120           # filename column width in pixels
-    gap_px   = 6             # horizontal gap between columns
-    ann_px   = 30            # pixels reserved below each image for annotation text
-    top_px   = 75            # suptitle + legend + column-header space
+    DPI      = 100
+    label_px = 120    # filename column width
+    gap_px   = 6      # gap between columns
+    ann_px   = 28     # space below each image row for annotation
+    title_px = 32     # height of title row
+    hdr_px   = 22     # height of column-header row
 
     fig_w_px = label_px + (thumb_w + gap_px) * 4
-    fig_h_px = top_px + n * (thumb_h + ann_px + gap_px)
+    fig_h_px = title_px + hdr_px + n * (thumb_h + ann_px + gap_px)
 
     fig_w = fig_w_px / DPI
     fig_h = fig_h_px / DPI
 
-    # Use GridSpec for precise control
     from matplotlib.gridspec import GridSpec
+
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=DPI)
 
     label_frac = label_px / fig_w_px
-    img_frac   = thumb_w   / fig_w_px
+    img_frac   = thumb_w  / fig_w_px
+    title_frac = title_px / fig_h_px
+    hdr_frac   = hdr_px   / fig_h_px
+    data_frac  = 1.0 - title_frac - hdr_frac
 
-    gs = GridSpec(
-        n, 5, figure=fig,
+    # Outer vertical split: [title | header | data]
+    from matplotlib.gridspec import GridSpecFromSubplotSpec
+    outer = GridSpec(
+        3, 1, figure=fig,
+        height_ratios=[title_frac, hdr_frac, data_frac],
+        hspace=0,
+        left=0.0, right=1.0, top=1.0, bottom=0.0,
+    )
+
+    # ── Row 0: title + legend ────────────────────────────────────────────────
+    ax_title = fig.add_subplot(outer[0])
+    ax_title.axis("off")
+    ax_title.text(0.5, 0.75,
+                  f"BSDS500 — NumPy Canny vs OpenCV Canny  {title_suffix}",
+                  ha="center", va="center", fontsize=10, fontweight="bold",
+                  transform=ax_title.transAxes)
+    ax_title.text(0.5, 0.20,
+                  "Diff key:  grey = both agree  ·  red = NumPy only  ·  blue = OpenCV only",
+                  ha="center", va="center", fontsize=7, style="italic",
+                  transform=ax_title.transAxes)
+
+    # ── Row 1: column headers ────────────────────────────────────────────────
+    hdr_gs = GridSpecFromSubplotSpec(
+        1, 5, subplot_spec=outer[1],
         width_ratios=[label_frac, img_frac, img_frac, img_frac, img_frac],
-        left=0.01, right=0.99,
-        top=1 - (top_px / fig_h_px),
-        bottom=0.01,
-        hspace=ann_px / thumb_h,   # relative vertical gap = annotation space / image height
         wspace=gap_px / thumb_w,
     )
+    col_labels = ["", "Original", "NumPy Canny", "OpenCV Canny", "Difference"]
+    for c, lbl in enumerate(col_labels):
+        ax_h = fig.add_subplot(hdr_gs[0, c])
+        ax_h.axis("off")
+        ax_h.text(0.5, 0.5, lbl,
+                  ha="center", va="center", fontsize=8, fontweight="bold",
+                  transform=ax_h.transAxes)
 
-    axes = [[fig.add_subplot(gs[r, c]) for c in range(5)] for r in range(n)]
-
-    # Column headers — keep short so they never overlap
-    headers = ["", "Original", "NumPy Canny", "OpenCV Canny", "Difference"]
-    for col, hdr in enumerate(headers):
-        axes[0][col].set_title(hdr, fontsize=8, fontweight="bold", pad=4)
-
-    # Diff-map legend as a single line below the main title
-    fig.text(
-        0.5, 0.997,
-        "Diff:  grey = both agree  ·  red = NumPy only  ·  blue = OpenCV only",
-        ha="center", va="top", fontsize=7, style="italic",
-        transform=fig.transFigure,
+    # ── Rows 2+: image data ──────────────────────────────────────────────────
+    data_gs = GridSpecFromSubplotSpec(
+        n, 5, subplot_spec=outer[2],
+        width_ratios=[label_frac, img_frac, img_frac, img_frac, img_frac],
+        hspace=ann_px / thumb_h,
+        wspace=gap_px / thumb_w,
     )
+    axes = [[fig.add_subplot(data_gs[r, c]) for c in range(5)] for r in range(n)]
 
     for row, rec in enumerate(records):
         m  = rec["metrics"]
@@ -321,11 +344,6 @@ def _show_grid(records: list[dict], title_suffix: str = "",
         for col in range(1, 5):
             ax[col].set_xticks([])
             ax[col].set_yticks([])
-
-    fig.suptitle(
-        f"BSDS500 — NumPy Canny vs OpenCV Canny  {title_suffix}",
-        fontsize=10, fontweight="bold", y=0.995,
-    )
 
     out_path = "canny_reliability_grid.png"
     plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
