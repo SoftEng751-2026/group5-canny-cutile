@@ -136,44 +136,14 @@ def postprocess_frame(args, nms_item):
     }
 
 
-def main():
-    args = parse_args()
+def run_pipeline(args, kernel_cpu):
+    """
+    Execute the pipelined video stream and return (rows, total_wall_time_seconds).
 
-    if args.max_frames < 0:
-        raise ValueError("max-frames must be >= 0")
-
-    if args.tile_size <= 0:
-        raise ValueError("tile-size must be positive")
-
-    kernel_cpu = make_gaussian_kernel(args.kernel_size, args.sigma)
-
-    source_tag = make_source_tag(args.source, args.image_loop)
-
-    if args.results_csv is None:
-        sigma_text = f"{args.sigma:g}".replace(".", "p")
-        args.results_csv = (
-            Path("report")
-            / f"26_video_stream_pipeline_fps_{source_tag}_tile{args.tile_size}_k{args.kernel_size}_s{sigma_text}.csv"
-        )
-
-    args.results_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    print("Pipelined video stream Canny demo")
-    print("---------------------------------")
-    print(f"Source: {args.image_loop if args.image_loop is not None else args.source}")
-    print(f"Resize width: {args.resize_width}")
-    print(f"Kernel size: {args.kernel_size}")
-    print(f"Sigma: {args.sigma}")
-    print(f"Tile size: {args.tile_size}")
-    print(f"Threshold mode: {args.threshold_mode}")
-    print(f"Results CSV: {args.results_csv}")
-    print()
-    print("Pipeline design:")
-    print("Producer: read frames")
-    print("GPU worker: resize/grayscale + Gaussian/Sobel/NMS")
-    print("CPU/main: threshold + hysteresis + display/write")
-    print("Press q in the display window to quit.")
-
+    args must be a Namespace with: source, image_loop, max_frames, resize_width,
+    tile_size, threshold_mode, high_percentile, low_ratio, low_threshold,
+    high_threshold, no_display, output_video.
+    """
     source_type, loop_frame, capture = open_frame_source(args.source, args.image_loop)
 
     input_queue = queue.Queue(maxsize=4)
@@ -272,6 +242,49 @@ def main():
 
     overall_end = time.perf_counter()
     total_wall_time = overall_end - overall_start
+
+    return rows, total_wall_time
+
+
+def main():
+    args = parse_args()
+
+    if args.max_frames < 0:
+        raise ValueError("max-frames must be >= 0")
+
+    if args.tile_size <= 0:
+        raise ValueError("tile-size must be positive")
+
+    kernel_cpu = make_gaussian_kernel(args.kernel_size, args.sigma)
+
+    source_tag = make_source_tag(args.source, args.image_loop)
+
+    if args.results_csv is None:
+        sigma_text = f"{args.sigma:g}".replace(".", "p")
+        args.results_csv = (
+            Path("report")
+            / f"26_video_stream_pipeline_fps_{source_tag}_tile{args.tile_size}_k{args.kernel_size}_s{sigma_text}.csv"
+        )
+
+    args.results_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    print("Pipelined video stream Canny demo")
+    print("---------------------------------")
+    print(f"Source: {args.image_loop if args.image_loop is not None else args.source}")
+    print(f"Resize width: {args.resize_width}")
+    print(f"Kernel size: {args.kernel_size}")
+    print(f"Sigma: {args.sigma}")
+    print(f"Tile size: {args.tile_size}")
+    print(f"Threshold mode: {args.threshold_mode}")
+    print(f"Results CSV: {args.results_csv}")
+    print()
+    print("Pipeline design:")
+    print("Producer: read frames")
+    print("GPU worker: resize/grayscale + Gaussian/Sobel/NMS")
+    print("CPU/main: threshold + hysteresis + display/write")
+    print("Press q in the display window to quit.")
+
+    rows, total_wall_time = run_pipeline(args, kernel_cpu)
 
     with args.results_csv.open("w", newline="", encoding="utf-8") as csv_file:
         fieldnames = [
