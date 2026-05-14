@@ -245,7 +245,7 @@ def _show_grid(records: list[dict], title_suffix: str = "",
     label_px = 120           # filename column width in pixels
     gap_px   = 6             # horizontal gap between columns
     ann_px   = 30            # pixels reserved below each image for annotation text
-    top_px   = 60            # suptitle + column-header space
+    top_px   = 75            # suptitle + legend + column-header space
 
     fig_w_px = label_px + (thumb_w + gap_px) * 4
     fig_h_px = top_px + n * (thumb_h + ann_px + gap_px)
@@ -272,11 +272,18 @@ def _show_grid(records: list[dict], title_suffix: str = "",
 
     axes = [[fig.add_subplot(gs[r, c]) for c in range(5)] for r in range(n)]
 
-    # Column headers
-    headers = ["", "Original", "NumPy Canny", "OpenCV Canny",
-               "Diff  (red=NumPy · blue=OpenCV · grey=both)"]
+    # Column headers — keep short so they never overlap
+    headers = ["", "Original", "NumPy Canny", "OpenCV Canny", "Difference"]
     for col, hdr in enumerate(headers):
         axes[0][col].set_title(hdr, fontsize=8, fontweight="bold", pad=4)
+
+    # Diff-map legend as a single line below the main title
+    fig.text(
+        0.5, 0.997,
+        "Diff:  grey = both agree  ·  red = NumPy only  ·  blue = OpenCV only",
+        ha="center", va="top", fontsize=7, style="italic",
+        transform=fig.transFigure,
+    )
 
     for row, rec in enumerate(records):
         m  = rec["metrics"]
