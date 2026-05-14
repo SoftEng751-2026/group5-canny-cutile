@@ -460,7 +460,7 @@ def _print_summary(records: list[dict]) -> dict:
 
 def main(
     max_images: int = None,       # None = run on ALL images (full BSDS500 test set)
-    n_display: int = 10,          # how many images to show in the visual grid
+    n_display: int = 6,           # how many images to show in the visual grid
     kernel_size: int = 5,
     sigma: float = 1.4,
     high_percentile: float = 90.0,
