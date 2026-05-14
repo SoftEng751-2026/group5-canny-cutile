@@ -229,103 +229,106 @@ def _resize_to(arr: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _show_grid(records: list[dict], title_suffix: str = "",
-               thumb_h: int = 200, thumb_w: int = 200) -> None:
+               thumb_size: int = 160) -> None:
     """
-    Display a clean grid of results.
+    Display a clean grid of results. Each image is resized to a square
+    thumbnail so all rows have identical height.
 
-    All images are resized to (thumb_h × thumb_w) so every row has
-    identical height regardless of the original image dimensions.
-
-    Layout per row:
-        col 0 – filename label (text only, no axes)
-        col 1 – Original grayscale
-        col 2 – NumPy Canny  + threshold info
-        col 3 – OpenCV Canny + edge-pixel %
-        col 4 – Difference map + agreement / F1
+    Columns: filename | Original | NumPy Canny | OpenCV Canny | Diff map
+    Stats are shown as text annotations in axes-fraction coordinates so
+    they are never clipped by the figure boundary.
     """
     n = len(records)
 
-    # 5 columns: label | original | numpy | opencv | diff
-    col_widths = [1.4, 2, 2, 2, 2]          # relative widths in inches per unit
-    fig_w = sum(col_widths) * 1.6
-    row_h = (thumb_h / 72) * 1.45           # convert px → inches with padding
-    fig_h = max(row_h * n + 1.2, 4)         # +1.2 for suptitle
+    thumb_in = thumb_size / 100          # thumbnail size in inches (100 dpi base)
+    label_in = 1.6                       # filename column width in inches
+    fig_w = label_in + thumb_in * 4 + 0.6
+    row_h_in = thumb_in + 0.55
+    fig_h = row_h_in * n + 0.9
 
     fig, axes = plt.subplots(
         n, 5,
         figsize=(fig_w, fig_h),
-        gridspec_kw={"width_ratios": col_widths},
+        gridspec_kw={"width_ratios": [label_in, thumb_in, thumb_in, thumb_in, thumb_in]},
         squeeze=False,
     )
+    fig.subplots_adjust(hspace=0.08, wspace=0.04, top=0.94, bottom=0.02,
+                        left=0.01, right=0.99)
 
-    # Column headers on row 0
-    col_headers = [
-        "",                     # label column — no header
-        "Original",
-        "NumPy Canny",
-        "OpenCV Canny",
-        "Difference\n(red=NumPy, blue=OpenCV, grey=both)",
-    ]
-    for col, hdr in enumerate(col_headers):
-        axes[0, col].set_title(hdr, fontsize=9, fontweight="bold", pad=4)
+    # Column headers (row 0 only)
+    headers = ["", "Original", "NumPy Canny", "OpenCV Canny",
+               "Diff  (red=NumPy · blue=OpenCV · grey=both)"]
+    for col, hdr in enumerate(headers):
+        axes[0, col].set_title(hdr, fontsize=8, fontweight="bold", pad=3)
 
     for row, rec in enumerate(records):
         m = rec["metrics"]
+        th = tw = thumb_size
 
-        # ---- col 0: filename label (text-only cell) ----
-        ax_lbl = axes[row, 0]
-        ax_lbl.axis("off")
-        ax_lbl.text(
-            0.95, 0.5, rec["name"],
-            ha="right", va="center",
-            fontsize=7.5, transform=ax_lbl.transAxes,
-            wrap=True,
+        # col 0 – filename label
+        axes[row, 0].axis("off")
+        axes[row, 0].text(
+            1.0, 0.5, rec["name"],
+            ha="right", va="center", fontsize=7,
+            transform=axes[row, 0].transAxes,
         )
 
-        # ---- col 1: original grayscale ----
-        gray_thumb = _resize_to(rec["gray"], thumb_h, thumb_w)
-        axes[row, 1].imshow(gray_thumb, cmap="gray", vmin=0, vmax=255,
-                            aspect="equal")
-
-        # ---- col 2: NumPy Canny ----
-        np_thumb = _resize_to(rec["np_edges"].astype(np.uint8) * 255,
-                               thumb_h, thumb_w)
-        axes[row, 2].imshow(np_thumb, cmap="gray", aspect="equal")
-        axes[row, 2].set_xlabel(
-            f"edges {m['numpy_edge_pct']:.1f}%\n"
-            f"thr [{rec['low']:.0f}, {rec['high']:.0f}]",
-            fontsize=7, labelpad=2,
+        # col 1 – original grayscale
+        axes[row, 1].imshow(
+            _resize_to(rec["gray"], th, tw),
+            cmap="gray", vmin=0, vmax=255, aspect="auto",
         )
 
-        # ---- col 3: OpenCV Canny ----
-        oc_thumb = _resize_to(rec["oc_edges"], thumb_h, thumb_w)
-        axes[row, 3].imshow(oc_thumb, cmap="gray", aspect="equal")
-        axes[row, 3].set_xlabel(
+        # col 2 – NumPy Canny
+        axes[row, 2].imshow(
+            _resize_to(rec["np_edges"].astype(np.uint8) * 255, th, tw),
+            cmap="gray", aspect="auto",
+        )
+        axes[row, 2].text(
+            0.5, -0.04,
+            f"edges {m['numpy_edge_pct']:.1f}%  thr [{rec['low']:.0f}–{rec['high']:.0f}]",
+            ha="center", va="top", fontsize=6.5,
+            transform=axes[row, 2].transAxes,
+        )
+
+        # col 3 – OpenCV Canny
+        axes[row, 3].imshow(
+            _resize_to(rec["oc_edges"], th, tw),
+            cmap="gray", aspect="auto",
+        )
+        axes[row, 3].text(
+            0.5, -0.04,
             f"edges {m['opencv_edge_pct']:.1f}%",
-            fontsize=7, labelpad=2,
+            ha="center", va="top", fontsize=6.5,
+            transform=axes[row, 3].transAxes,
         )
 
-        # ---- col 4: diff map ----
-        diff_thumb = _resize_to(m["diff_map"], thumb_h, thumb_w)
-        axes[row, 4].imshow(diff_thumb, aspect="equal")
-        axes[row, 4].set_xlabel(
-            f"agree {m['agreement']*100:.1f}%  F1 {m['f1']:.3f}",
-            fontsize=7, labelpad=2,
+        # col 4 – diff map
+        axes[row, 4].imshow(
+            _resize_to(m["diff_map"], th, tw),
+            aspect="auto",
+        )
+        axes[row, 4].text(
+            0.5, -0.04,
+            f"agree {m['agreement']*100:.1f}%   F1 {m['f1']:.3f}",
+            ha="center", va="top", fontsize=6.5,
+            transform=axes[row, 4].transAxes,
         )
 
-        # Remove ticks from image columns
+        # Remove ticks on image columns
         for col in range(1, 5):
             axes[row, col].set_xticks([])
             axes[row, col].set_yticks([])
 
     fig.suptitle(
-        f"BSDS500 — NumPy Canny vs OpenCV Canny{title_suffix}",
-        fontsize=11, fontweight="bold", y=1.01,
+        f"BSDS500 — NumPy Canny vs OpenCV Canny  {title_suffix}",
+        fontsize=10, fontweight="bold",
     )
-    plt.tight_layout(rect=[0, 0, 1, 1])
-    plt.savefig("canny_reliability_grid.png", dpi=150, bbox_inches="tight")
+
+    out_path = "canny_reliability_grid.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.show()
-    print("✓ Grid saved to canny_reliability_grid.png")
+    print(f"✓ Grid saved to {out_path}")
 
 
 # ---------------------------------------------------------------------------
