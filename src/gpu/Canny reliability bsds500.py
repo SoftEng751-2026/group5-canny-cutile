@@ -229,104 +229,99 @@ def _resize_to(arr: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _show_grid(records: list[dict], title_suffix: str = "",
-               thumb_size: int = 160) -> None:
+               thumb_w: int = 240, thumb_h: int = 160) -> None:
     """
-    Display a clean grid of results. Each image is resized to a square
-    thumbnail so all rows have identical height.
+    Display a clean grid of results.
 
-    Columns: filename | Original | NumPy Canny | OpenCV Canny | Diff map
-    Stats are shown as text annotations in axes-fraction coordinates so
-    they are never clipped by the figure boundary.
+    Each image is resized to (thumb_h × thumb_w) — 3:2 landscape ratio —
+    which matches the typical BSDS500 image aspect ratio and avoids distortion.
+    Stats are rendered as xlabel (not overlaid text) with enough row padding
+    so they never overlap the next row's image.
     """
     n = len(records)
 
-    thumb_in = thumb_size / 100          # thumbnail size in inches (100 dpi base)
-    label_in = 1.6                       # filename column width in inches
-    fig_w = label_in + thumb_in * 4 + 0.6
-    row_h_in = thumb_in + 0.55
-    fig_h = row_h_in * n + 0.9
+    # Figure dimensions
+    DPI = 100
+    label_px = 120           # filename column width in pixels
+    gap_px   = 6             # horizontal gap between columns
+    ann_px   = 30            # pixels reserved below each image for annotation text
+    top_px   = 60            # suptitle + column-header space
 
-    fig, axes = plt.subplots(
-        n, 5,
-        figsize=(fig_w, fig_h),
-        gridspec_kw={"width_ratios": [label_in, thumb_in, thumb_in, thumb_in, thumb_in]},
-        squeeze=False,
+    fig_w_px = label_px + (thumb_w + gap_px) * 4
+    fig_h_px = top_px + n * (thumb_h + ann_px + gap_px)
+
+    fig_w = fig_w_px / DPI
+    fig_h = fig_h_px / DPI
+
+    # Use GridSpec for precise control
+    from matplotlib.gridspec import GridSpec
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=DPI)
+
+    label_frac = label_px / fig_w_px
+    img_frac   = thumb_w   / fig_w_px
+
+    gs = GridSpec(
+        n, 5, figure=fig,
+        width_ratios=[label_frac, img_frac, img_frac, img_frac, img_frac],
+        left=0.01, right=0.99,
+        top=1 - (top_px / fig_h_px),
+        bottom=0.01,
+        hspace=ann_px / thumb_h,   # relative vertical gap = annotation space / image height
+        wspace=gap_px / thumb_w,
     )
-    fig.subplots_adjust(hspace=0.08, wspace=0.04, top=0.94, bottom=0.02,
-                        left=0.01, right=0.99)
 
-    # Column headers (row 0 only)
+    axes = [[fig.add_subplot(gs[r, c]) for c in range(5)] for r in range(n)]
+
+    # Column headers
     headers = ["", "Original", "NumPy Canny", "OpenCV Canny",
                "Diff  (red=NumPy · blue=OpenCV · grey=both)"]
     for col, hdr in enumerate(headers):
-        axes[0, col].set_title(hdr, fontsize=8, fontweight="bold", pad=3)
+        axes[0][col].set_title(hdr, fontsize=8, fontweight="bold", pad=4)
 
     for row, rec in enumerate(records):
-        m = rec["metrics"]
-        th = tw = thumb_size
+        m  = rec["metrics"]
+        ax = axes[row]
 
-        # col 0 – filename label
-        axes[row, 0].axis("off")
-        axes[row, 0].text(
-            1.0, 0.5, rec["name"],
-            ha="right", va="center", fontsize=7,
-            transform=axes[row, 0].transAxes,
-        )
+        # col 0 – filename
+        ax[0].axis("off")
+        ax[0].text(0.98, 0.5, rec["name"],
+                   ha="right", va="center", fontsize=7,
+                   transform=ax[0].transAxes)
 
-        # col 1 – original grayscale
-        axes[row, 1].imshow(
-            _resize_to(rec["gray"], th, tw),
-            cmap="gray", vmin=0, vmax=255, aspect="auto",
-        )
+        # col 1 – original (keep true aspect ratio via "equal", let axes shrink)
+        ax[1].imshow(_resize_to(rec["gray"], thumb_h, thumb_w),
+                     cmap="gray", vmin=0, vmax=255, aspect="equal")
 
         # col 2 – NumPy Canny
-        axes[row, 2].imshow(
-            _resize_to(rec["np_edges"].astype(np.uint8) * 255, th, tw),
-            cmap="gray", aspect="auto",
-        )
-        axes[row, 2].text(
-            0.5, -0.04,
+        ax[2].imshow(_resize_to(rec["np_edges"].astype(np.uint8) * 255, thumb_h, thumb_w),
+                     cmap="gray", aspect="equal")
+        ax[2].set_xlabel(
             f"edges {m['numpy_edge_pct']:.1f}%  thr [{rec['low']:.0f}–{rec['high']:.0f}]",
-            ha="center", va="top", fontsize=6.5,
-            transform=axes[row, 2].transAxes,
-        )
+            fontsize=7, labelpad=2)
 
         # col 3 – OpenCV Canny
-        axes[row, 3].imshow(
-            _resize_to(rec["oc_edges"], th, tw),
-            cmap="gray", aspect="auto",
-        )
-        axes[row, 3].text(
-            0.5, -0.04,
-            f"edges {m['opencv_edge_pct']:.1f}%",
-            ha="center", va="top", fontsize=6.5,
-            transform=axes[row, 3].transAxes,
-        )
+        ax[3].imshow(_resize_to(rec["oc_edges"], thumb_h, thumb_w),
+                     cmap="gray", aspect="equal")
+        ax[3].set_xlabel(f"edges {m['opencv_edge_pct']:.1f}%", fontsize=7, labelpad=2)
 
         # col 4 – diff map
-        axes[row, 4].imshow(
-            _resize_to(m["diff_map"], th, tw),
-            aspect="auto",
-        )
-        axes[row, 4].text(
-            0.5, -0.04,
+        ax[4].imshow(_resize_to(m["diff_map"], thumb_h, thumb_w), aspect="equal")
+        ax[4].set_xlabel(
             f"agree {m['agreement']*100:.1f}%   F1 {m['f1']:.3f}",
-            ha="center", va="top", fontsize=6.5,
-            transform=axes[row, 4].transAxes,
-        )
+            fontsize=7, labelpad=2)
 
-        # Remove ticks on image columns
+        # Remove ticks
         for col in range(1, 5):
-            axes[row, col].set_xticks([])
-            axes[row, col].set_yticks([])
+            ax[col].set_xticks([])
+            ax[col].set_yticks([])
 
     fig.suptitle(
         f"BSDS500 — NumPy Canny vs OpenCV Canny  {title_suffix}",
-        fontsize=10, fontweight="bold",
+        fontsize=10, fontweight="bold", y=0.995,
     )
 
     out_path = "canny_reliability_grid.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
     plt.show()
     print(f"✓ Grid saved to {out_path}")
 
