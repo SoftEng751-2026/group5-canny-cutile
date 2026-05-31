@@ -120,7 +120,33 @@ def nms(mag_gpu, angle_gpu):
     return out
 
 
+def threshold_and_hysteresis_gpu(nms_gpu, high_pct, low_ratio):
+    """Fully GPU-resident threshold + hysteresis using cupyx connected components."""
+    from cupyx.scipy import ndimage as cpnd
+
+    pos = nms_gpu[nms_gpu > 0]
+    if pos.size == 0:
+        return cp.zeros(nms_gpu.shape, dtype=cp.bool_), 0.0, 0.0
+
+    high = float(cp.percentile(pos, high_pct))
+    low = float(low_ratio * high)
+
+    strong = nms_gpu >= high
+    weak = (nms_gpu >= low) & ~strong
+
+    candidate = (strong | weak).astype(cp.uint8)
+    labels, n = cpnd.label(candidate, structure=cp.ones((3, 3), dtype=cp.int32))
+
+    strong_labels = cp.unique(labels[strong])
+    keep = cp.zeros(n + 1, dtype=cp.bool_)
+    keep[strong_labels] = True
+    keep[0] = False
+
+    return keep[labels], low, high
+
+
 def threshold_and_hysteresis(nms_cpu, high_pct, low_ratio):
+    """CPU fallback: kept for compatibility with other scripts."""
     pos = nms_cpu[nms_cpu > 0]
     if pos.size == 0:
         return np.zeros_like(nms_cpu, bool), 0.0, 0.0
@@ -137,7 +163,8 @@ def threshold_and_hysteresis(nms_cpu, high_pct, low_ratio):
 
 # ── End-to-end run ────────────────────────────────────────────────────────────
 
-def run(image_cpu, kernel_cpu, tile_size=256, high_pct=90.0, low_ratio=0.5):
+def run(image_cpu, kernel_cpu, tile_size=256, high_pct=90.0, low_ratio=0.5,
+        gpu_hysteresis=True):
     t = {}
     img_gpu = cp.asarray(image_cpu, dtype=cp.float32)
 
@@ -152,17 +179,23 @@ def run(image_cpu, kernel_cpu, tile_size=256, high_pct=90.0, low_ratio=0.5):
     t['sobel'] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    nms_gpu = nms(mag, angle)
+    nms_out = nms(mag, angle)
     cp.cuda.Stream.null.synchronize()
     t['nms'] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    nms_cpu = cp.asnumpy(nms_gpu)
-    t['transfer'] = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    edges, low, high = threshold_and_hysteresis(nms_cpu, high_pct, low_ratio)
-    t['hysteresis'] = time.perf_counter() - t0
+    if gpu_hysteresis:
+        edges_gpu, low, high = threshold_and_hysteresis_gpu(nms_out, high_pct, low_ratio)
+        cp.cuda.Stream.null.synchronize()
+        t['hysteresis'] = time.perf_counter() - t0
+        edges = cp.asnumpy(edges_gpu)
+        t['transfer'] = 0.0
+    else:
+        nms_cpu = cp.asnumpy(nms_out)
+        t['transfer'] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        edges, low, high = threshold_and_hysteresis(nms_cpu, high_pct, low_ratio)
+        t['hysteresis'] = time.perf_counter() - t0
 
     t['total'] = sum(t.values())
     return edges, low, high, t
@@ -181,6 +214,8 @@ def parse_args():
     p.add_argument('--runs', type=int, default=1)
     p.add_argument('--output', type=Path, default=None)
     p.add_argument('--no-display', action='store_true')
+    p.add_argument('--cpu-hysteresis', action='store_true',
+                   help='Use CPU OpenCV hysteresis instead of GPU (slower, for comparison)')
     return p.parse_args()
 
 
@@ -190,17 +225,21 @@ def main():
     kernel_cpu = make_gaussian_kernel(args.kernel_size, args.sigma)
 
     gauss_impl = 'cuTile' if _HAS_CUTILE and args.kernel_size == 5 else 'CuPy'
+    hyst_impl = 'CPU (OpenCV, --cpu-hysteresis)' if args.cpu_hysteresis else 'GPU (cupyx.scipy.ndimage)'
     print(f'cuTile available : {_HAS_CUTILE}')
     print(f'Gaussian (k={args.kernel_size}) : {gauss_impl}')
     print(f'Sobel            : cuTile (CuPy fallback on incompatible GPU)')
     print(f'NMS              : CuPy')
-    print(f'Hysteresis       : CPU (connected components)')
+    print(f'Hysteresis       : {hyst_impl}')
+
+    gpu_hyst = not args.cpu_hysteresis
 
     # Warm-up run to exclude JIT/CUDA init cost from reported timings.
-    run(image_cpu, kernel_cpu, args.tile_size, args.high_percentile, args.low_ratio)
+    run(image_cpu, kernel_cpu, args.tile_size, args.high_percentile, args.low_ratio,
+        gpu_hysteresis=gpu_hyst)
 
     records = [run(image_cpu, kernel_cpu, args.tile_size,
-                   args.high_percentile, args.low_ratio)
+                   args.high_percentile, args.low_ratio, gpu_hysteresis=gpu_hyst)
                for _ in range(args.runs)]
 
     edges, low, high, _ = records[-1]
