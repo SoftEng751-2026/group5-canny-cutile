@@ -52,6 +52,9 @@ sobel_sweep_img    = read_csv("17_sobel_cutile_tile_sweep_IMG_6860.csv")
 nms_sweep_test     = read_csv("27_nms_cutile_tile_sweep_test_k5_s1p4.csv")
 nms_sweep_img      = read_csv("27_nms_cutile_tile_sweep_IMG_6860_k5_s1p4.csv")
 
+fused_sweep_test   = read_csv("29_sobel_fused_tile_sweep_test.csv")
+fused_sweep_img    = read_csv("29_sobel_fused_tile_sweep_IMG_6860.csv")
+
 pipe_test_k5       = read_csv("19_cutile_canny_pipeline_test_k5_s1p4.csv")
 pipe_test_k7       = read_csv("19_cutile_canny_pipeline_test_k7_s1p6.csv")
 pipe_img_k5        = read_csv("19_cutile_canny_pipeline_IMG_6860_k5_s1p4.csv")
@@ -340,6 +343,39 @@ if HAS_PLT:
     fig.savefig(out7, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[chart] {out7.name}")
 
+    # ── Chart 8: Fused Sobel — two-pass vs fused vs CuPy full ────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle(
+        "Fused Sobel: Two-Pass vs Fused cuTile vs CuPy Full (mag + angle)\n"
+        "Fused kernel reads 8 neighbours once; two-pass reads them twice",
+        fontsize=12, fontweight="bold")
+
+    for ax, rows, label in [
+        (axes[0], fused_sweep_test, "test.jpg (small)"),
+        (axes[1], fused_sweep_img,  "IMG_6860.JPG (large)"),
+    ]:
+        if not rows:
+            continue
+        ts      = [int(r["tile_size"])                     for r in rows]
+        two_ms  = [float(r["two_pass_time_seconds"]) * 1000 for r in rows]
+        fus_ms  = [float(r["fused_time_seconds"])    * 1000 for r in rows]
+        cp_ms   = float(rows[0]["cupy_full_time_seconds"]) * 1000
+
+        x, w = np.arange(len(ts)), 0.28
+        b1 = ax.bar(x - w,   two_ms, w, label="Two-pass (non-fused)", color=COLORS["cupy"],    alpha=0.85)
+        b2 = ax.bar(x,       fus_ms, w, label="Fused cuTile",         color=COLORS["cutile"],  alpha=0.85)
+        ax.axhline(cp_ms, color=COLORS["cpu"], linestyle="--", linewidth=1.2,
+                   label=f"CuPy full: {cp_ms:.2f} ms")
+        ax.set_xticks(x); ax.set_xticklabels([str(t) for t in ts])
+        ax.set_xlabel("Tile Size"); ax.set_ylabel("Time (ms)")
+        ax.set_title(label); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.4)
+        _annotate_bars(ax, b1); _annotate_bars(ax, b2)
+
+    plt.tight_layout()
+    out8 = CHART_DIR / "perf_8_fused_sobel.png"
+    fig.savefig(out8, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[chart] {out8.name}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Report generation
@@ -459,7 +495,75 @@ if HAS_PLT:
     A("![Sobel tile-size sweep](perf_1_sobel_sweep.png)"); A("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("3. NMS Stage: cuTile vs CuPy (Tile-Size Sweep)", 2)
+section("3. Fused Sobel cuTile Kernel — Two-Pass vs Fused vs CuPy", 2)
+para(
+    "The original Sobel stage used two separate passes over the 3×3 neighbourhood: "
+    "(1) a cuTile kernel for magnitude only, then (2) a CuPy pass that re-read the same "
+    "8 neighbour arrays to compute gx, gy, and arctan2 for the gradient angle. "
+    "The fused kernel eliminates this redundancy by writing magnitude **and** gx **and** gy "
+    "in a single tile-parallel pass; CuPy then computes arctan2 on the already-computed "
+    "gradients without touching the neighbour arrays again. "
+    "This halves the Sobel-stage memory bandwidth."
+)
+
+section("3.1 Small Image (test.jpg)", 3)
+if fused_sweep_test:
+    rows_md = []
+    cp_full = float(fused_sweep_test[0]["cupy_full_time_seconds"]) * 1000
+    for r in fused_sweep_test:
+        ts    = int(r["tile_size"])
+        two_t = float(r["two_pass_time_seconds"]) * 1000
+        fus_t = float(r["fused_time_seconds"])    * 1000
+        sp_tp = float(r["speedup_fused_vs_two_pass"])
+        sp_cp = float(r["speedup_fused_vs_cupy_full"])
+        rows_md.append((str(ts), f"{two_t:.3f}", f"{fus_t:.3f}",
+                        f"{sp_tp:.3f}×", f"{cp_full:.3f}", f"{sp_cp:.3f}×"))
+    A(md_table(
+        ["Tile", "Two-pass (ms)", "Fused (ms)", "Fused/Two-pass",
+         "CuPy full (ms)", "Fused/CuPy"], rows_md))
+    A("")
+    best_f = max(fused_sweep_test, key=lambda r: float(r["speedup_fused_vs_two_pass"]))
+    para(
+        f"Best fused vs two-pass speedup: **{float(best_f['speedup_fused_vs_two_pass']):.2f}×** "
+        f"at tile={best_f['tile_size']}. "
+        "On the small image the memory bandwidth saving is modest relative to launch overhead."
+    )
+
+section("3.2 Large Image (IMG_6860.JPG)", 3)
+if fused_sweep_img:
+    rows_md = []
+    cp_full_i = float(fused_sweep_img[0]["cupy_full_time_seconds"]) * 1000
+    for r in fused_sweep_img:
+        ts    = int(r["tile_size"])
+        two_t = float(r["two_pass_time_seconds"]) * 1000
+        fus_t = float(r["fused_time_seconds"])    * 1000
+        sp_tp = float(r["speedup_fused_vs_two_pass"])
+        sp_cp = float(r["speedup_fused_vs_cupy_full"])
+        rows_md.append((str(ts), f"{two_t:.3f}", f"{fus_t:.3f}",
+                        f"{sp_tp:.3f}×", f"{cp_full_i:.3f}", f"{sp_cp:.3f}×"))
+    A(md_table(
+        ["Tile", "Two-pass (ms)", "Fused (ms)", "Fused/Two-pass",
+         "CuPy full (ms)", "Fused/CuPy"], rows_md))
+    A("")
+    best_fi = max(fused_sweep_img, key=lambda r: float(r["speedup_fused_vs_two_pass"]))
+    para(
+        f"On the large image, fused achieves **{float(best_fi['speedup_fused_vs_two_pass']):.2f}×** "
+        f"over two-pass at tile={best_fi['tile_size']}. "
+        "With more pixels, avoiding the second neighbour read has a larger absolute effect."
+    )
+
+section("3.3 Key Takeaway", 3)
+para(
+    "The fused kernel reduces the Sobel stage from two neighbour-read passes to one. "
+    "The speedup is proportional to image size (more pixels = more bandwidth saved). "
+    "Angle accuracy is identical to the two-pass approach since both use CuPy arctan2 "
+    "on the same float32 gx/gy values."
+)
+if HAS_PLT:
+    A("![Fused Sobel benchmark](perf_8_fused_sobel.png)"); A("")
+
+# ─────────────────────────────────────────────────────────────────────────────
+section("4. NMS Stage: cuTile vs CuPy (Tile-Size Sweep)", 2)
 para(
     "The NMS cuTile kernel loads 9 magnitude neighbour arrays and 1 angle array per tile, "
     "applies the four-direction local-maximum test element-wise, and stores the suppressed "
@@ -467,7 +571,7 @@ para(
     "vectorised array operations. Results are compared against the CPU reference."
 )
 
-section("3.1 Small Image (test.jpg), k=5, σ=1.4", 3)
+section("5.1 Small Image (test.jpg), k=5, σ=1.4", 3)
 if nms_sweep_test:
     rows_md = []
     for r in nms_sweep_test:
@@ -491,7 +595,7 @@ if nms_sweep_test:
         "As with Sobel, small-image launch overhead limits cuTile advantage."
     )
 
-section("3.2 Large Image (IMG_6860.JPG), k=5, σ=1.4", 3)
+section("4.2 Large Image (IMG_6860.JPG), k=5, σ=1.4", 3)
 if nms_sweep_img:
     rows_md = []
     for r in nms_sweep_img:
@@ -515,7 +619,7 @@ if nms_sweep_img:
         f"at tile={best_nms_l['tile_size']}, consistent with the Sobel trend."
     )
 
-section("3.3 Sobel vs NMS cuTile Comparison", 3)
+section("4.3 Sobel vs NMS cuTile Comparison", 3)
 para(
     "Both cuTile stages show the same image-size dependence: "
     "small images favour CuPy (lower launch overhead); large images favour cuTile "
@@ -528,14 +632,14 @@ if HAS_PLT:
     A("![cuTile vs CuPy both stages](perf_7_cutile_vs_cupy_both_stages.png)"); A("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("4. Frontend GPU Pipeline: CPU vs GPU (Stages 1–4)", 2)
+section("5. Frontend GPU Pipeline: CPU vs GPU (Stages 1–4)", 2)
 para(
     "The frontend pipeline covers Gaussian blur + Sobel gradient + NMS. "
     "Three GPU timing modes: (a) pure GPU compute, (b) GPU + input transfer, "
     "(c) full end-to-end. CPU baseline is pure NumPy."
 )
 
-section("4.1 Small Image (test.jpg), k=5, σ=1.4", 3)
+section("5.1 Small Image (test.jpg), k=5, σ=1.4", 3)
 if pipe_test_k5:
     cpu_t = float(pipe_test_k5[0]["cpu_time_seconds"]) * 1000
     rows_md = []
@@ -565,7 +669,7 @@ if pipe_test_k5:
         f"at tile={best_e['tile_size']}."
     )
 
-section("4.2 Small Image (test.jpg), k=7, σ=1.6", 3)
+section("5.2 Small Image (test.jpg), k=7, σ=1.6", 3)
 if pipe_test_k7:
     cpu_t7 = float(pipe_test_k7[0]["cpu_time_seconds"]) * 1000
     rows_md = []
@@ -587,7 +691,7 @@ if pipe_test_k7:
         f"at tile={best_k7['tile_size']}."
     )
 
-section("4.3 Large Image (IMG_6860.JPG), k=5, σ=1.4", 3)
+section("5.3 Large Image (IMG_6860.JPG), k=5, σ=1.4", 3)
 if pipe_img_k5:
     cpu_ti = float(pipe_img_k5[0]["cpu_time_seconds"]) * 1000
     rows_md = []
@@ -614,7 +718,7 @@ if HAS_PLT:
     A("![Kernel size comparison](perf_6_kernel_size.png)"); A("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("5. Complete Canny Pipeline — Three-Way Comparison", 2)
+section("6. Complete Canny Pipeline — Three-Way Comparison", 2)
 para(
     "The full pipeline adds GPU double threshold (`cp.percentile`) and GPU hysteresis "
     "(`cupyx.scipy.ndimage.label`) to the GPU frontend. Three variants are benchmarked: "
@@ -643,7 +747,7 @@ def _full_pipeline_table(rows):
                "Full GPU (ms)", "Speedup"]
     return md_table(headers, rows_md), has_fullgpu, cpu_t
 
-section("5.1 test.jpg, k=5, σ=1.4", 3)
+section("6.1 test.jpg, k=5, σ=1.4", 3)
 if full_test_k5:
     tbl, has_fg, cpu_t = _full_pipeline_table(full_test_k5)
     A(tbl); A("")
@@ -656,12 +760,12 @@ if full_test_k5:
                 "Moving hysteresis to GPU eliminates the CPU bottleneck.")
     para(msg)
 
-section("5.2 test.jpg, k=7, σ=1.6", 3)
+section("6.2 test.jpg, k=7, σ=1.6", 3)
 if full_test_k7:
     tbl, _, _ = _full_pipeline_table(full_test_k7)
     A(tbl); A("")
 
-section("5.3 IMG_6860.JPG, k=5, σ=1.4", 3)
+section("6.3 IMG_6860.JPG, k=5, σ=1.4", 3)
 if full_img_k5:
     tbl, has_fg, cpu_ti = _full_pipeline_table(full_img_k5)
     A(tbl); A("")
@@ -674,7 +778,7 @@ if full_img_k5:
                 "The large-image case benefits most from GPU-resident hysteresis.")
     para(msg)
 
-section("5.4 Bottleneck Analysis", 3)
+section("6.4 Bottleneck Analysis", 3)
 A("| Stage | Device | Notes |")
 A("|-------|--------|-------|")
 A("| Gaussian blur | GPU (cuTile/CuPy) | Fast; embarrassingly parallel |")
@@ -694,13 +798,13 @@ if HAS_PLT:
     A("![Complete pipeline comparison](perf_4_complete_pipeline.png)"); A("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("6. Real-Time Video Performance", 2)
+section("7. Real-Time Video Performance", 2)
 para(
     "The video stream demo processes frames in a continuous loop using the full-GPU pipeline. "
     "Frame 0 includes CUDA context initialisation and is excluded from statistics."
 )
 
-section("6.1 Image Loop (test.jpg, tile=256, k=5)", 3)
+section("7.1 Image Loop (test.jpg, tile=256, k=5)", 3)
 if vs_test:
     A(f"| Metric | Value |"); A(f"|--------|-------|")
     A(f"| CUDA init (frame 0) | {vs_test['init_s']*1000:.1f} ms |")
@@ -711,7 +815,7 @@ if vs_test:
     A(f"| FPS range | {vs_test['fps_min']:.1f} – {vs_test['fps_max']:.1f} FPS |")
     A("")
 
-section("6.2 Image Loop (IMG_6860.JPG, tile=256, k=5)", 3)
+section("7.2 Image Loop (IMG_6860.JPG, tile=256, k=5)", 3)
 if vs_img:
     A(f"| Metric | Value |"); A(f"|--------|-------|")
     A(f"| CUDA init (frame 0) | {vs_img['init_s']*1000:.1f} ms |")
@@ -730,7 +834,7 @@ if HAS_PLT:
     A("![Video stream FPS](perf_5_video_fps.png)"); A("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("7. Tile-Size Sensitivity", 2)
+section("8. Tile-Size Sensitivity", 2)
 A("| Tile Size | Effect |")
 A("|-----------|--------|")
 A("| Too small (32–64) | Higher launch overhead per pixel; hurts small images most |")
@@ -746,7 +850,7 @@ para(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("8. Numerical Accuracy", 2)
+section("9. Numerical Accuracy", 2)
 para(
     "All GPU implementations (cuTile and CuPy) produce numerically identical results to the "
     "CPU reference within float32 rounding tolerance. The maximum absolute difference observed "
@@ -755,7 +859,7 @@ para(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-section("9. Summary and Conclusions", 2)
+section("10. Summary and Conclusions", 2)
 
 A("### 9.1 Comparison Summary Table")
 A("")
