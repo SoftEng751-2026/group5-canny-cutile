@@ -155,6 +155,98 @@ def launch_sobel_cutile(image_gpu, tile_size: int):
     return full_output
 
 
+@ct.kernel
+def sobel_fused_from_neighbors_cutile(
+    top_left,
+    top_center,
+    top_right,
+    middle_left,
+    middle_right,
+    bottom_left,
+    bottom_center,
+    bottom_right,
+    magnitude_output,
+    gx_output,
+    gy_output,
+    tile_size: ct.Constant[int],
+):
+    """
+    Fused cuTile Sobel kernel: magnitude + gx + gy in one pass.
+
+    Reads each of the 8 neighbour arrays exactly once and writes three outputs.
+    This eliminates the redundant second neighbour read that the original pipeline
+    required to compute gradient angle via CuPy after the magnitude-only kernel.
+    """
+    b = ct.bid(0)
+    s = (tile_size,)
+
+    tl = ct.load(top_left,     index=(b,), shape=s)
+    tc = ct.load(top_center,   index=(b,), shape=s)
+    tr = ct.load(top_right,    index=(b,), shape=s)
+    ml = ct.load(middle_left,  index=(b,), shape=s)
+    mr = ct.load(middle_right, index=(b,), shape=s)
+    bl = ct.load(bottom_left,  index=(b,), shape=s)
+    bc = ct.load(bottom_center,index=(b,), shape=s)
+    br = ct.load(bottom_right, index=(b,), shape=s)
+
+    gx = -tl + tr - 2.0 * ml + 2.0 * mr - bl + br
+    gy =  tl + 2.0 * tc + tr - bl - 2.0 * bc - br
+
+    ct.store(magnitude_output, index=(b,), tile=ct.sqrt(gx * gx + gy * gy))
+    ct.store(gx_output,        index=(b,), tile=gx)
+    ct.store(gy_output,        index=(b,), tile=gy)
+
+
+def launch_sobel_fused_cutile(image_gpu, tile_size: int):
+    """
+    Run the fused cuTile Sobel kernel and return (magnitude, gx, gy).
+
+    All three outputs share the same neighbour arrays, so each of the 8 neighbour
+    arrays is read exactly once — half the memory bandwidth of the original two-pass
+    approach (magnitude-only cuTile kernel + separate CuPy pass for angle).
+    """
+    padded_neighbours, original_size, height, width = prepare_sobel_neighbor_arrays(
+        image_gpu, tile_size
+    )
+
+    padded_size = padded_neighbours[0].size
+    mag_padded = cp.zeros(padded_size, dtype=cp.float32)
+    gx_padded  = cp.zeros(padded_size, dtype=cp.float32)
+    gy_padded  = cp.zeros(padded_size, dtype=cp.float32)
+
+    grid = ((padded_size + tile_size - 1) // tile_size, 1, 1)
+
+    ct.launch(
+        cp.cuda.get_current_stream(),
+        grid,
+        sobel_fused_from_neighbors_cutile,
+        (
+            padded_neighbours[0],
+            padded_neighbours[1],
+            padded_neighbours[2],
+            padded_neighbours[3],
+            padded_neighbours[4],
+            padded_neighbours[5],
+            padded_neighbours[6],
+            padded_neighbours[7],
+            mag_padded,
+            gx_padded,
+            gy_padded,
+            tile_size,
+        ),
+    )
+
+    interior_shape = (height - 2, width - 2)
+
+    def _to_full(padded):
+        interior = padded[:original_size].reshape(interior_shape)
+        full = cp.zeros((height, width), dtype=cp.float32)
+        full[1:-1, 1:-1] = interior
+        return full
+
+    return _to_full(mag_padded), _to_full(gx_padded), _to_full(gy_padded)
+
+
 def sobel_magnitude_cupy_compute_only(image_gpu):
     """
     Compute Sobel magnitude only using CuPy.

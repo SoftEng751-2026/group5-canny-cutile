@@ -8,18 +8,16 @@ import cv2
 import cupy as cp
 import numpy as np
 
-from cutile_canny_pipeline_benchmark import canny_pipeline_gpu_with_input_transfer
+from cutile_full_pipeline import run as canny_run_full_gpu
 from gaussian_benchmark import make_gaussian_kernel
 from video_stream_demo import (
     create_video_writer,
-    double_threshold_and_hysteresis,
     frame_to_grayscale_float32,
     make_source_tag,
     open_frame_source,
     parse_args,
     read_next_frame,
     resize_frame,
-    select_thresholds,
 )
 
 
@@ -59,21 +57,22 @@ def producer_worker(args, source_type, loop_frame, capture, input_queue, stop_ev
         input_queue.put(SENTINEL)
 
 
-def gpu_frontend_worker(args, kernel_cpu, input_queue, nms_queue, stop_event):
+def gpu_full_worker(args, kernel_cpu, input_queue, result_queue, stop_event):
     """
-    Stage 1: GPU frontend.
+    Stage 1: Full GPU Canny pipeline.
 
     For each frame:
-    resize -> grayscale -> GPU Gaussian/Sobel/NMS -> copy NMS result back to CPU.
+      resize -> grayscale -> Gaussian (cuTile) -> Sobel fused (cuTile) ->
+      NMS (cuTile) -> threshold (CuPy) -> hysteresis (cupyx) -> edges CPU
 
-    The CPU post-processing stage can run in parallel with this worker on the
-    previous frame.
+    All computation stays on GPU; only the final bool edge map is transferred
+    back to CPU for display/write. No separate CPU post-processing stage needed.
     """
     while not stop_event.is_set():
         item = input_queue.get()
 
         if item is SENTINEL:
-            nms_queue.put(SENTINEL)
+            result_queue.put(SENTINEL)
             break
 
         stage_start = time.perf_counter()
@@ -81,59 +80,33 @@ def gpu_frontend_worker(args, kernel_cpu, input_queue, nms_queue, stop_event):
         resized_frame = resize_frame(item["frame_bgr"], args.resize_width)
         image_cpu = frame_to_grayscale_float32(resized_frame)
 
-        _, _, _, nms_gpu = canny_pipeline_gpu_with_input_transfer(
+        edges, low, high, _ = canny_run_full_gpu(
             image_cpu=image_cpu,
             kernel_cpu=kernel_cpu,
             tile_size=args.tile_size,
+            high_pct=args.high_percentile,
+            low_ratio=args.low_ratio,
+            gpu_hysteresis=True,
         )
 
-        # Ensure GPU work is finished before copying the NMS output to CPU.
         cp.cuda.Stream.null.synchronize()
-        nms_cpu = cp.asnumpy(nms_gpu)
-
         stage_end = time.perf_counter()
 
-        nms_queue.put(
+        edges_uint8 = edges.astype(np.uint8) * 255
+        edge_pixel_ratio = float(np.count_nonzero(edges) / edges.size)
+
+        result_queue.put(
             {
                 "frame_index": item["frame_index"],
                 "submit_time": item["submit_time"],
                 "resized_frame": resized_frame,
-                "nms_cpu": nms_cpu,
-                "gpu_frontend_seconds": stage_end - stage_start,
+                "edges_uint8": edges_uint8,
+                "low_threshold": low,
+                "high_threshold": high,
+                "edge_pixel_ratio": edge_pixel_ratio,
+                "gpu_full_seconds": stage_end - stage_start,
             }
         )
-
-
-def postprocess_frame(args, nms_item):
-    """
-    Stage 2: CPU post-processing.
-
-    Apply threshold selection, double thresholding and hysteresis.
-    """
-    stage_start = time.perf_counter()
-
-    low, high = select_thresholds(
-        nms_image=nms_item["nms_cpu"],
-        threshold_mode=args.threshold_mode,
-        high_percentile=args.high_percentile,
-        low_ratio=args.low_ratio,
-        low_threshold=args.low_threshold,
-        high_threshold=args.high_threshold,
-    )
-
-    edges_bool = double_threshold_and_hysteresis(nms_item["nms_cpu"], low, high)
-    edges_uint8 = edges_bool.astype(np.uint8) * 255
-    edge_pixel_ratio = float(np.count_nonzero(edges_bool) / edges_bool.size)
-
-    stage_end = time.perf_counter()
-
-    return {
-        "edges_uint8": edges_uint8,
-        "low_threshold": low,
-        "high_threshold": high,
-        "edge_pixel_ratio": edge_pixel_ratio,
-        "cpu_postprocess_seconds": stage_end - stage_start,
-    }
 
 
 def main():
@@ -169,16 +142,16 @@ def main():
     print(f"Results CSV: {args.results_csv}")
     print()
     print("Pipeline design:")
-    print("Producer: read frames")
-    print("GPU worker: resize/grayscale + Gaussian/Sobel/NMS")
-    print("CPU/main: threshold + hysteresis + display/write")
+    print("Producer : read frames")
+    print("GPU worker: resize/grayscale + full GPU Canny (cuTile Gaussian+Sobel+NMS, cupyx hysteresis)")
+    print("Main     : display/write only")
     print("Press q in the display window to quit.")
 
     source_type, loop_frame, capture = open_frame_source(args.source, args.image_loop)
 
-    input_queue = queue.Queue(maxsize=4)
-    nms_queue = queue.Queue(maxsize=4)
-    stop_event = threading.Event()
+    input_queue  = queue.Queue(maxsize=4)
+    result_queue = queue.Queue(maxsize=4)
+    stop_event   = threading.Event()
 
     video_writer = None
     rows = []
@@ -191,8 +164,8 @@ def main():
     )
 
     gpu_worker = threading.Thread(
-        target=gpu_frontend_worker,
-        args=(args, kernel_cpu, input_queue, nms_queue, stop_event),
+        target=gpu_full_worker,
+        args=(args, kernel_cpu, input_queue, result_queue, stop_event),
         daemon=True,
     )
 
@@ -203,14 +176,12 @@ def main():
         gpu_worker.start()
 
         while True:
-            nms_item = nms_queue.get()
+            item = result_queue.get()
 
-            if nms_item is SENTINEL:
+            if item is SENTINEL:
                 break
 
-            post_result = postprocess_frame(args, nms_item)
-
-            edge_bgr = cv2.cvtColor(post_result["edges_uint8"], cv2.COLOR_GRAY2BGR)
+            edge_bgr = cv2.cvtColor(item["edges_uint8"], cv2.COLOR_GRAY2BGR)
 
             if video_writer is None and args.output_video is not None:
                 video_writer = create_video_writer(args.output_video, edge_bgr.shape)
@@ -219,31 +190,30 @@ def main():
                 video_writer.write(edge_bgr)
 
             frame_done_time = time.perf_counter()
-            latency_seconds = frame_done_time - nms_item["submit_time"]
+            latency_seconds = frame_done_time - item["submit_time"]
 
             rows.append(
                 {
-                    "frame_index": nms_item["frame_index"],
-                    "gpu_frontend_seconds": nms_item["gpu_frontend_seconds"],
-                    "cpu_postprocess_seconds": post_result["cpu_postprocess_seconds"],
-                    "latency_seconds": latency_seconds,
-                    "low_threshold": post_result["low_threshold"],
-                    "high_threshold": post_result["high_threshold"],
-                    "edge_pixel_ratio": post_result["edge_pixel_ratio"],
+                    "frame_index":       item["frame_index"],
+                    "gpu_full_seconds":  item["gpu_full_seconds"],
+                    "latency_seconds":   latency_seconds,
+                    "low_threshold":     item["low_threshold"],
+                    "high_threshold":    item["high_threshold"],
+                    "edge_pixel_ratio":  item["edge_pixel_ratio"],
                 }
             )
 
             processed_frames += 1
 
             if not args.no_display:
-                display_frame = np.hstack((nms_item["resized_frame"], edge_bgr))
+                display_frame = np.hstack((item["resized_frame"], edge_bgr))
 
                 recent_elapsed = time.perf_counter() - overall_start
                 throughput_fps = processed_frames / recent_elapsed if recent_elapsed > 0 else 0.0
 
                 cv2.putText(
                     display_frame,
-                    f"Pipeline FPS: {throughput_fps:.2f}",
+                    f"Full-GPU FPS: {throughput_fps:.2f}",
                     (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1.0,
@@ -252,7 +222,7 @@ def main():
                     cv2.LINE_AA,
                 )
 
-                cv2.imshow("Original | Pipelined Canny edges", display_frame)
+                cv2.imshow("Original | Full-GPU Canny edges", display_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     stop_event.set()
@@ -276,8 +246,7 @@ def main():
     with args.results_csv.open("w", newline="", encoding="utf-8") as csv_file:
         fieldnames = [
             "frame_index",
-            "gpu_frontend_seconds",
-            "cpu_postprocess_seconds",
+            "gpu_full_seconds",
             "latency_seconds",
             "low_threshold",
             "high_threshold",
@@ -290,37 +259,34 @@ def main():
         for row in rows:
             writer.writerow(
                 {
-                    "frame_index": row["frame_index"],
-                    "gpu_frontend_seconds": f"{row['gpu_frontend_seconds']:.8f}",
-                    "cpu_postprocess_seconds": f"{row['cpu_postprocess_seconds']:.8f}",
-                    "latency_seconds": f"{row['latency_seconds']:.8f}",
-                    "low_threshold": f"{row['low_threshold']:.8f}",
-                    "high_threshold": f"{row['high_threshold']:.8f}",
+                    "frame_index":      row["frame_index"],
+                    "gpu_full_seconds": f"{row['gpu_full_seconds']:.8f}",
+                    "latency_seconds":  f"{row['latency_seconds']:.8f}",
+                    "low_threshold":    f"{row['low_threshold']:.8f}",
+                    "high_threshold":   f"{row['high_threshold']:.8f}",
                     "edge_pixel_ratio": f"{row['edge_pixel_ratio']:.8f}",
                 }
             )
 
     if rows:
-        avg_gpu = float(np.mean([row["gpu_frontend_seconds"] for row in rows]))
-        avg_cpu = float(np.mean([row["cpu_postprocess_seconds"] for row in rows]))
-        avg_latency = float(np.mean([row["latency_seconds"] for row in rows]))
-        avg_edge_ratio = float(np.mean([row["edge_pixel_ratio"] for row in rows]))
-        throughput_fps = len(rows) / total_wall_time if total_wall_time > 0 else float("inf")
+        avg_gpu    = float(np.mean([r["gpu_full_seconds"] for r in rows]))
+        avg_lat    = float(np.mean([r["latency_seconds"]  for r in rows]))
+        avg_edges  = float(np.mean([r["edge_pixel_ratio"] for r in rows]))
+        throughput = len(rows) / total_wall_time if total_wall_time > 0 else float("inf")
 
         print()
-        print("Pipelined video stream summary")
-        print("------------------------------")
-        print(f"Processed frames: {len(rows)}")
-        print(f"Total wall time: {total_wall_time:.6f} seconds")
-        print(f"Throughput FPS: {throughput_fps:.2f}")
-        print(f"Average GPU frontend time: {avg_gpu:.6f} seconds/frame")
-        print(f"Average CPU postprocess time: {avg_cpu:.6f} seconds/frame")
-        print(f"Average end-to-end latency: {avg_latency:.6f} seconds/frame")
-        print(f"Average edge pixel ratio: {avg_edge_ratio:.6f}")
-        print(f"Results saved to: {args.results_csv}")
+        print("Full-GPU pipelined video stream summary")
+        print("----------------------------------------")
+        print(f"Processed frames          : {len(rows)}")
+        print(f"Total wall time           : {total_wall_time:.6f} s")
+        print(f"Throughput FPS            : {throughput:.2f}")
+        print(f"Avg full-GPU time/frame   : {avg_gpu*1000:.2f} ms")
+        print(f"Avg end-to-end latency    : {avg_lat*1000:.2f} ms")
+        print(f"Avg edge pixel ratio      : {avg_edges:.6f}")
+        print(f"Results saved to          : {args.results_csv}")
 
         if args.output_video is not None:
-            print(f"Output video saved to: {args.output_video}")
+            print(f"Output video saved to     : {args.output_video}")
     else:
         print("No frames were processed.")
 

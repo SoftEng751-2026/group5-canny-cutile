@@ -19,7 +19,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from gaussian_benchmark import load_grayscale_image, make_gaussian_kernel
-from sobel_cutile_benchmark import launch_sobel_cutile, sobel_magnitude_cupy_compute_only
+from sobel_cutile_benchmark import (
+    launch_sobel_cutile,
+    launch_sobel_fused_cutile,
+    sobel_magnitude_cupy_compute_only,
+)
 from nms_cutile_benchmark import launch_nms_cutile
 from nms_benchmark import non_max_suppression_gpu_compute_only
 
@@ -94,17 +98,26 @@ def gaussian_blur(img_gpu, kernel_cpu, tile_size):
 
 
 def sobel(blurred_gpu, tile_size):
+    """
+    Fused cuTile Sobel: reads 8 neighbours once, outputs magnitude + gx + gy.
+    CuPy then computes arctan2 on the pre-computed gradients — no second
+    neighbour read. Falls back to a two-pass CuPy implementation if cuTile
+    is unavailable.
+    """
     try:
-        mag = launch_sobel_cutile(blurred_gpu, tile_size)
+        mag, gx, gy = launch_sobel_fused_cutile(blurred_gpu, tile_size)
+        angle = (cp.arctan2(gy, gx) * 180.0 / cp.pi) % 180.0
+        return mag, angle
     except Exception:
-        mag = sobel_magnitude_cupy_compute_only(blurred_gpu)
+        pass
 
-    # Gradient angle is required by NMS; computed via CuPy.
-    gx = cp.zeros_like(blurred_gpu)
-    gy = cp.zeros_like(blurred_gpu)
+    # CuPy fallback: two-pass (magnitude + angle separately)
     b = blurred_gpu
-    gx[1:-1, 1:-1] = -b[:-2, :-2] + b[:-2, 2:] - 2*b[1:-1, :-2] + 2*b[1:-1, 2:] - b[2:, :-2] + b[2:, 2:]
-    gy[1:-1, 1:-1] =  b[:-2, :-2] + 2*b[:-2, 1:-1] + b[:-2, 2:] - b[2:, :-2] - 2*b[2:, 1:-1] - b[2:, 2:]
+    gx = cp.zeros_like(b)
+    gy = cp.zeros_like(b)
+    gx[1:-1, 1:-1] = -b[:-2,:-2] + b[:-2,2:] - 2*b[1:-1,:-2] + 2*b[1:-1,2:] - b[2:,:-2] + b[2:,2:]
+    gy[1:-1, 1:-1] =  b[:-2,:-2] + 2*b[:-2,1:-1] + b[:-2,2:] - b[2:,:-2] - 2*b[2:,1:-1] - b[2:,2:]
+    mag = cp.sqrt(gx * gx + gy * gy)
     angle = (cp.arctan2(gy, gx) * 180.0 / cp.pi) % 180.0
     return mag, angle
 
@@ -226,7 +239,7 @@ def main():
     hyst_impl  = 'CPU (OpenCV, --cpu-hysteresis)' if args.cpu_hysteresis else 'GPU (cupyx.scipy.ndimage)'
     print(f'cuTile available : {_HAS_CUTILE}')
     print(f'Gaussian (k={args.kernel_size}) : {gauss_impl}')
-    print(f'Sobel            : {nms_impl} (CuPy fallback on incompatible GPU)')
+    print(f'Sobel (fused)    : {nms_impl} (mag+gx+gy in one pass; CuPy fallback)')
     print(f'NMS              : {nms_impl} (CuPy fallback on incompatible GPU)')
     print(f'Hysteresis       : {hyst_impl}')
 
