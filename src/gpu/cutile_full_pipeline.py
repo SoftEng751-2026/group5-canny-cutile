@@ -4,9 +4,9 @@ Canny edge detection maximising cuTile coverage.
 Pipeline:
   Gaussian blur  -- cuTile (k=5) or CuPy fallback
   Sobel          -- cuTile        or CuPy fallback
-  NMS            -- CuPy
-  Threshold      -- NumPy
-  Hysteresis     -- CPU (OpenCV connected components)
+  NMS            -- cuTile        or CuPy fallback
+  Threshold      -- GPU (CuPy)
+  Hysteresis     -- GPU (cupyx.scipy.ndimage) or CPU fallback
 """
 import argparse
 import sys
@@ -20,6 +20,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from gaussian_benchmark import load_grayscale_image, make_gaussian_kernel
 from sobel_cutile_benchmark import launch_sobel_cutile, sobel_magnitude_cupy_compute_only
+from nms_cutile_benchmark import launch_nms_cutile
+from nms_benchmark import non_max_suppression_gpu_compute_only
 
 try:
     import cuda.tile as ct
@@ -107,17 +109,12 @@ def sobel(blurred_gpu, tile_size):
     return mag, angle
 
 
-def nms(mag_gpu, angle_gpu):
-    d, out = angle_gpu % 180.0, cp.zeros_like(mag_gpu)
-    c, a = mag_gpu[1:-1, 1:-1], d[1:-1, 1:-1]
-    keep = (
-        ((a < 22.5) | (a >= 157.5)) & (c >= mag_gpu[1:-1, :-2]) & (c >= mag_gpu[1:-1, 2:]) |
-        ((a >= 22.5) & (a < 67.5))  & (c >= mag_gpu[:-2, 2:])   & (c >= mag_gpu[2:, :-2])  |
-        ((a >= 67.5) & (a < 112.5)) & (c >= mag_gpu[:-2, 1:-1]) & (c >= mag_gpu[2:, 1:-1]) |
-        ((a >= 112.5) & (a < 157.5))& (c >= mag_gpu[:-2, :-2])  & (c >= mag_gpu[2:, 2:])
-    )
-    out[1:-1, 1:-1] = cp.where(keep, c, 0.0)
-    return out
+def nms(mag_gpu, angle_gpu, tile_size=256):
+    """NMS via cuTile kernel; falls back to CuPy if cuTile unavailable."""
+    try:
+        return launch_nms_cutile(mag_gpu, angle_gpu, tile_size)
+    except Exception:
+        return non_max_suppression_gpu_compute_only(mag_gpu, angle_gpu)
 
 
 def threshold_and_hysteresis_gpu(nms_gpu, high_pct, low_ratio):
@@ -179,7 +176,7 @@ def run(image_cpu, kernel_cpu, tile_size=256, high_pct=90.0, low_ratio=0.5,
     t['sobel'] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    nms_out = nms(mag, angle)
+    nms_out = nms(mag, angle, tile_size)
     cp.cuda.Stream.null.synchronize()
     t['nms'] = time.perf_counter() - t0
 
@@ -225,11 +222,12 @@ def main():
     kernel_cpu = make_gaussian_kernel(args.kernel_size, args.sigma)
 
     gauss_impl = 'cuTile' if _HAS_CUTILE and args.kernel_size == 5 else 'CuPy'
-    hyst_impl = 'CPU (OpenCV, --cpu-hysteresis)' if args.cpu_hysteresis else 'GPU (cupyx.scipy.ndimage)'
+    nms_impl   = 'cuTile' if _HAS_CUTILE else 'CuPy'
+    hyst_impl  = 'CPU (OpenCV, --cpu-hysteresis)' if args.cpu_hysteresis else 'GPU (cupyx.scipy.ndimage)'
     print(f'cuTile available : {_HAS_CUTILE}')
     print(f'Gaussian (k={args.kernel_size}) : {gauss_impl}')
-    print(f'Sobel            : cuTile (CuPy fallback on incompatible GPU)')
-    print(f'NMS              : CuPy')
+    print(f'Sobel            : {nms_impl} (CuPy fallback on incompatible GPU)')
+    print(f'NMS              : {nms_impl} (CuPy fallback on incompatible GPU)')
     print(f'Hysteresis       : {hyst_impl}')
 
     gpu_hyst = not args.cpu_hysteresis
