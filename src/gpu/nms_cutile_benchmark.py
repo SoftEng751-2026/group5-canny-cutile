@@ -189,7 +189,106 @@ def launch_nms_cutile(magnitude_gpu, angle_gpu, tile_size):
     return full_output
 
 
+# ── Row-view NMS: eliminates 9 of 10 full-image copies ───────────────────────
+#
+# Same row-view strategy as the Sobel row-view kernel:
+#   1 pad copy of magnitude  (H+2)×Wp + 1 angle copy H×Wp  ≈ 2 HW
+# vs old: 9 copies of interior mag + 1 angle copy            ≈ 10 HW
+# → ~5× less copying; same _nms_cutile_kernel reused unchanged.
+
+def _pad_width_to_multiple(arr2d, tile_size):
+    """Pad array width to a multiple of tile_size. Returns view or copy."""
+    _, W = arr2d.shape
+    rem = W % tile_size
+    if rem == 0:
+        return arr2d
+    return cp.pad(arr2d, ((0, 0), (0, tile_size - rem)), mode="edge")
+
+
+def launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size):
+    """
+    Run the cuTile NMS kernel using row-view data layout.
+
+    Data-layout differences vs launch_nms_cutile:
+      • magnitude: padded once to (H+2)×Wp; 9 neighbor views are 1D col-offset
+        slices of 3 contiguous row arrays → no per-neighbour full-image copy.
+      • angle: width-padded to H×Wp (1 copy); center angle accessed with no
+        col offset (same block index b as magnitude views).
+
+    Falls back to CuPy NMS if cuTile is unavailable.
+    """
+    if not _HAS_CUTILE:
+        return non_max_suppression_gpu_compute_only(magnitude_gpu, angle_gpu)
+
+    H, W = magnitude_gpu.shape
+
+    # ── magnitude: 1 pad copy, then 9 no-copy views ──────────────────────────
+    mag_padded = cp.pad(magnitude_gpu, 1, mode="edge")        # (H+2)×(W+2)
+    mag_padded = _pad_width_to_multiple(mag_padded, tile_size)  # (H+2)×Wp
+    Wp = mag_padded.shape[1]
+    num_col_tiles = Wp // tile_size
+    total_tiles   = H * num_col_tiles
+
+    # Contiguous row views (ravel = view, no copy)
+    top_flat = mag_padded[0:H,   :].ravel()
+    ctr_flat = mag_padded[1:H+1, :].ravel()
+    bot_flat = mag_padded[2:H+2, :].ravel()
+
+    # 9 col-offset views (pointer offset only, no copy)
+    mag_c  = ctr_flat[1:]   # center mag
+    mag_l  = ctr_flat[0:]   # left
+    mag_r  = ctr_flat[2:]   # right
+    mag_t  = top_flat[1:]   # top-center
+    mag_b  = bot_flat[1:]   # bottom-center
+    mag_tl = top_flat[0:]   # top-left
+    mag_tr = top_flat[2:]   # top-right
+    mag_bl = bot_flat[0:]   # bottom-left
+    mag_br = bot_flat[2:]   # bottom-right
+
+    # ── angle: normalise + width-pad (1 copy), then 1 view ───────────────────
+    # Center angle for pixel (r, c) is at position r*Wp + c in the Wp-wide
+    # layout, so no col offset is needed.
+    angle_norm = (angle_gpu % 180.0).astype(cp.float32)       # H×W, 1 copy
+    angle_wide = _pad_width_to_multiple(angle_norm, tile_size) # H×Wp
+    ang_c = angle_wide.ravel()[0:]                             # no col offset
+
+    # ── kernel launch ─────────────────────────────────────────────────────────
+    out_flat = cp.zeros(total_tiles * tile_size, dtype=cp.float32)
+    grid = (total_tiles, 1, 1)
+
+    ct.launch(
+        cp.cuda.get_current_stream(),
+        grid,
+        _nms_cutile_kernel,
+        (mag_c, mag_l, mag_r, mag_t, mag_b,
+         mag_tl, mag_tr, mag_bl, mag_br,
+         ang_c, out_flat, tile_size),
+    )
+
+    # Extract interior pixels: rows 1..H-2, cols 1..W-2 in H×Wp layout
+    full = cp.zeros((H, W), dtype=cp.float32)
+    full[1:-1, 1:-1] = out_flat.reshape(H, Wp)[1:H-1, 1:W-1]
+    return full
+
+
 # ── Benchmark helpers ─────────────────────────────────────────────────────────
+
+def benchmark_cutile_nms_row_view(magnitude_gpu, angle_gpu, tile_size, runs, warmup):
+    """Benchmark the row-view NMS (reduced copy overhead)."""
+    for _ in range(warmup):
+        launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size)
+
+    cp.cuda.Stream.null.synchronize()
+    start = time.perf_counter()
+
+    for _ in range(runs):
+        out = launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size)
+
+    cp.cuda.Stream.null.synchronize()
+    end = time.perf_counter()
+
+    return (end - start) / runs, out
+
 
 def benchmark_cutile_nms(magnitude_gpu, angle_gpu, tile_size, runs, warmup):
     for _ in range(warmup):
@@ -373,8 +472,68 @@ def main():
         )
 
     print()
-    print(f"Best tile size   : {best_result['tile_size']}")
-    print(f"CSV saved to     : {csv_path}")
+    print(f"Best tile size (old cuTile): {best_result['tile_size']}")
+    print(f"CSV saved to               : {csv_path}")
+
+    # ── Row-view NMS sweep ────────────────────────────────────────────────────
+    print()
+    print("Row-view NMS: 1 pad copy + 9 views  vs  old (9 copies)")
+    print("──────────────────────────────────────────────────────────")
+
+    results_rv = []
+    best_rv = None
+
+    for tile_size in tile_sizes:
+        for _ in range(args.warmup):
+            launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size)
+        cp.cuda.Stream.null.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(args.runs):
+            out_rv = launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size)
+        cp.cuda.Stream.null.synchronize()
+        rv_t = (time.perf_counter() - t0) / args.runs
+
+        out_rv_cpu = cp.asnumpy(out_rv)
+        diff_cpu  = float(np.max(np.abs(nms_cpu - out_rv_cpu)))
+        diff_cupy = float(np.max(np.abs(nms_cupy_cpu - out_rv_cpu)))
+
+        r = {
+            "tile_size":              tile_size,
+            "row_view_time_seconds":  rv_t,
+            "cupy_time_seconds":      cupy_time,
+            "cpu_time_seconds":       cpu_time,
+            "speedup_vs_cupy":        cupy_time / rv_t if rv_t > 0 else float("inf"),
+            "speedup_vs_cpu":         cpu_time  / rv_t if rv_t > 0 else float("inf"),
+            "max_abs_diff_vs_cpu":    diff_cpu,
+            "max_abs_diff_vs_cupy":   diff_cupy,
+        }
+        results_rv.append(r)
+        if best_rv is None or rv_t < best_rv["row_view_time_seconds"]:
+            best_rv = r
+
+    csv_rv = output_dir / f"32_nms_row_view_tile_sweep_{tag}.csv"
+    with csv_rv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "tile_size", "row_view_time_seconds", "cupy_time_seconds",
+            "cpu_time_seconds", "speedup_vs_cupy", "speedup_vs_cpu",
+            "max_abs_diff_vs_cpu", "max_abs_diff_vs_cupy"])
+        w.writeheader()
+        for r in results_rv:
+            w.writerow({k: f"{v:.8f}" if isinstance(v, float) else v
+                        for k, v in r.items()})
+
+    print(f"CuPy NMS: {cupy_time*1000:8.3f} ms")
+    print()
+    print(f"{'Tile':>5} | {'Row-view(ms)':>12} | {'vs CuPy':>8} | "
+          f"{'vs CPU':>8} | {'diff vs CPU':>12}")
+    print("─" * 60)
+    for r in results_rv:
+        print(f"{r['tile_size']:>5} | "
+              f"{r['row_view_time_seconds']*1000:>12.3f} | "
+              f"{r['speedup_vs_cupy']:>8.3f}× | "
+              f"{r['speedup_vs_cpu']:>8.3f}× | "
+              f"{r['max_abs_diff_vs_cpu']:>12.6f}")
+    print(f"\nCSV saved to: {csv_rv}")
     print(f"CPU edge image   : {cpu_img_path}")
     print(f"CuPy edge image  : {cupy_img_path}")
     print(f"cuTile edge image: {best_img_path}")

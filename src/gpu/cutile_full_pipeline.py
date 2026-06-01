@@ -22,9 +22,10 @@ from gaussian_benchmark import load_grayscale_image, make_gaussian_kernel
 from sobel_cutile_benchmark import (
     launch_sobel_cutile,
     launch_sobel_fused_cutile,
+    launch_sobel_row_view,
     sobel_magnitude_cupy_compute_only,
 )
-from nms_cutile_benchmark import launch_nms_cutile
+from nms_cutile_benchmark import launch_nms_cutile, launch_nms_row_view
 from nms_benchmark import non_max_suppression_gpu_compute_only
 
 try:
@@ -99,19 +100,20 @@ def gaussian_blur(img_gpu, kernel_cpu, tile_size):
 
 def sobel(blurred_gpu, tile_size):
     """
-    Fused cuTile Sobel: reads 8 neighbours once, outputs magnitude + gx + gy.
-    CuPy then computes arctan2 on the pre-computed gradients — no second
-    neighbour read. Falls back to a two-pass CuPy implementation if cuTile
-    is unavailable.
+    Row-view fused cuTile Sobel:
+      - Pads image once, builds 8 zero-copy col-offset views
+      - Reads each neighbour exactly once, writes mag + gx + gy
+      - ~2× fewer element copies vs the pre-materialised neighbour approach
+    Falls back to a two-pass CuPy implementation if cuTile is unavailable.
     """
     try:
-        mag, gx, gy = launch_sobel_fused_cutile(blurred_gpu, tile_size)
+        mag, gx, gy = launch_sobel_row_view(blurred_gpu, tile_size)
         angle = (cp.arctan2(gy, gx) * 180.0 / cp.pi) % 180.0
         return mag, angle
     except Exception:
         pass
 
-    # CuPy fallback: two-pass (magnitude + angle separately)
+    # CuPy fallback
     b = blurred_gpu
     gx = cp.zeros_like(b)
     gy = cp.zeros_like(b)
@@ -123,9 +125,14 @@ def sobel(blurred_gpu, tile_size):
 
 
 def nms(mag_gpu, angle_gpu, tile_size=256):
-    """NMS via cuTile kernel; falls back to CuPy if cuTile unavailable."""
+    """
+    Row-view cuTile NMS:
+      - Pads magnitude once, builds 9 zero-copy col-offset views
+      - ~5× fewer element copies vs the pre-materialised neighbour approach
+    Falls back to CuPy if cuTile is unavailable.
+    """
     try:
-        return launch_nms_cutile(mag_gpu, angle_gpu, tile_size)
+        return launch_nms_row_view(mag_gpu, angle_gpu, tile_size)
     except Exception:
         return non_max_suppression_gpu_compute_only(mag_gpu, angle_gpu)
 

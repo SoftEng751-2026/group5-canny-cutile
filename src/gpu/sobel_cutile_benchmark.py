@@ -247,6 +247,109 @@ def launch_sobel_fused_cutile(image_gpu, tile_size: int):
     return _to_full(mag_padded), _to_full(gx_padded), _to_full(gy_padded)
 
 
+# ── Row-view Sobel: eliminates the 8× full-image copy ─────────────────────────
+#
+# Key insight: in a C-contiguous 2D array, slices that take *complete rows*
+# (all columns) are themselves C-contiguous views — ravel() returns a view with
+# no copy.  We pad the image once, extract 3 row-range views (top/centre/bottom),
+# then create 9 column-offset views by slicing the 1D flattened rows with [0:],
+# [1:], [2:].  The ct.load index maps block b → row r = b // num_col_tiles,
+# col tile bx = b % num_col_tiles, so the same 1D block-indexing scheme works.
+#
+# Copy budget:
+#   old: 8 × ascontiguousarray  ≈ 8 HW  element copies
+#   new: 1 × cp.pad + 3 extract ≈ 1 HW + 3 HW  = 4 HW  copies  (~2× less)
+
+def _pad_width_to_multiple(arr2d, tile_size):
+    """Pad array columns so width is a multiple of tile_size. Returns view or copy."""
+    _, W = arr2d.shape
+    rem = W % tile_size
+    if rem == 0:
+        return arr2d
+    return cp.pad(arr2d, ((0, 0), (0, tile_size - rem)), mode="edge")
+
+
+def prepare_sobel_row_views(image_gpu, tile_size):
+    """
+    Return 8 column-shifted 1D views (no copies) derived from one padded image.
+
+    Layout
+    ------
+    padded : (H+2) × Wp  where Wp = ceil(W+2, tile_size) × tile_size
+    top_flat / ctr_flat / bot_flat : contiguous 1D views of H×Wp row slices
+    top_l/c/r, ctr_l/r, bot_l/c/r : column-offset 1D slice views (no copy)
+
+    Each block b processes tile_size pixels.  Row r = b // num_col_tiles,
+    col tile bx = b % num_col_tiles, so block b loads from position b*tile_size
+    in each view — exactly the right row/column segment.
+    """
+    H, W = image_gpu.shape
+
+    # 1 copy: pad image by 1 pixel on all sides
+    padded = cp.pad(image_gpu, 1, mode="edge")          # (H+2) × (W+2)
+    padded = _pad_width_to_multiple(padded, tile_size)  # may copy if W+2 % ts ≠ 0
+    Wp = padded.shape[1]
+    num_col_tiles = Wp // tile_size
+
+    # Contiguous row-range views — ravel() returns a VIEW (no copy)
+    top_flat = padded[0:H,   :].ravel()   # rows 0..H-1  of padded
+    ctr_flat = padded[1:H+1, :].ravel()   # rows 1..H    of padded
+    bot_flat = padded[2:H+2, :].ravel()   # rows 2..H+1  of padded
+
+    # Column-offset views — 1D slice creates a view with pointer offset (no copy)
+    top_l = top_flat[0:];  top_c = top_flat[1:];  top_r = top_flat[2:]
+    ctr_l = ctr_flat[0:];                          ctr_r = ctr_flat[2:]
+    bot_l = bot_flat[0:];  bot_c = bot_flat[1:];  bot_r = bot_flat[2:]
+
+    total_tiles = H * num_col_tiles
+
+    return (top_l, top_c, top_r,
+            ctr_l,        ctr_r,
+            bot_l, bot_c, bot_r,
+            total_tiles, num_col_tiles, H, W, Wp)
+
+
+def launch_sobel_row_view(image_gpu, tile_size: int):
+    """
+    Fused Sobel using row-view data layout — ~2× fewer element copies than
+    launch_sobel_fused_cutile.
+
+    Returns (magnitude, gx, gy) full-size (H×W) GPU arrays.
+    """
+    views = prepare_sobel_row_views(image_gpu, tile_size)
+    (top_l, top_c, top_r,
+     ctr_l,        ctr_r,
+     bot_l, bot_c, bot_r,
+     total_tiles, num_col_tiles, H, W, Wp) = views
+
+    mag_flat = cp.zeros(total_tiles * tile_size, dtype=cp.float32)
+    gx_flat  = cp.zeros(total_tiles * tile_size, dtype=cp.float32)
+    gy_flat  = cp.zeros(total_tiles * tile_size, dtype=cp.float32)
+
+    grid = (total_tiles, 1, 1)
+
+    ct.launch(
+        cp.cuda.get_current_stream(),
+        grid,
+        sobel_fused_from_neighbors_cutile,   # reuse the same fused kernel
+        (top_l, top_c, top_r,
+         ctr_l, ctr_r,
+         bot_l, bot_c, bot_r,
+         mag_flat, gx_flat, gy_flat,
+         tile_size),
+    )
+
+    # The H×Wp output layout is: row r_flat = original row r_flat,
+    # col c_flat = original col c_flat.  Interior pixels are at
+    # original rows 1..H-2, cols 1..W-2  →  H×Wp[1:H-1, 1:W-1].
+    def _extract(flat):
+        full = cp.zeros((H, W), dtype=cp.float32)
+        full[1:-1, 1:-1] = flat.reshape(H, Wp)[1:H-1, 1:W-1]
+        return full
+
+    return _extract(mag_flat), _extract(gx_flat), _extract(gy_flat)
+
+
 def sobel_magnitude_cupy_compute_only(image_gpu):
     """
     Compute Sobel magnitude only using CuPy.
@@ -656,6 +759,66 @@ def main():
             f"{r['max_abs_diff_fused_vs_cpu']:>10.6f}"
         )
     print(f"\nCSV → {csv_fused}")
+
+    # ── Part 3: row-view vs fused vs CuPy full ────────────────────────────────
+    print()
+    print("Part 3 — Row-view Sobel: 1 pad copy + 9 views vs fused (8 copies)")
+    print("────────────────────────────────────────────────────────────────────")
+
+    results_rv = []
+    best_rv = None
+
+    for tile_size in tile_sizes:
+        rv_t, rv_mag, rv_ang = benchmark_fused_sobel.__wrapped__(image_gpu, tile_size, args.runs, args.warmup) \
+            if hasattr(benchmark_fused_sobel, '__wrapped__') else (None, None, None)
+
+        # Inline benchmark for row-view
+        def _rv(): return launch_sobel_row_view(image_gpu, tile_size)
+        for _ in range(args.warmup): _rv()
+        cp.cuda.Stream.null.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(args.runs): rv_mag2, rv_gx, rv_gy = _rv()
+        cp.cuda.Stream.null.synchronize()
+        rv_t = (time.perf_counter() - t0) / args.runs
+
+        rv_mag_cpu = cp.asnumpy(rv_mag2)
+        diff = float(np.max(np.abs(cpu_magnitude - rv_mag_cpu)))
+
+        r = {
+            "tile_size": tile_size,
+            "row_view_time_seconds": rv_t,
+            "cupy_full_time_seconds": cupy_full_time,
+            "speedup_rv_vs_cupy_full": cupy_full_time / rv_t if rv_t > 0 else float("inf"),
+            "max_abs_diff_vs_cpu": diff,
+        }
+        results_rv.append(r)
+        if best_rv is None or rv_t < best_rv["row_view_time_seconds"]:
+            best_rv = r
+
+    csv_rv = output_dir / f"31_sobel_row_view_tile_sweep_{output_tag}.csv"
+    with csv_rv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "tile_size", "row_view_time_seconds", "cupy_full_time_seconds",
+            "speedup_rv_vs_cupy_full", "max_abs_diff_vs_cpu"])
+        w.writeheader()
+        for r in results_rv:
+            w.writerow({
+                "tile_size":                r["tile_size"],
+                "row_view_time_seconds":    f"{r['row_view_time_seconds']:.8f}",
+                "cupy_full_time_seconds":   f"{r['cupy_full_time_seconds']:.8f}",
+                "speedup_rv_vs_cupy_full":  f"{r['speedup_rv_vs_cupy_full']:.4f}",
+                "max_abs_diff_vs_cpu":      f"{r['max_abs_diff_vs_cpu']:.8f}",
+            })
+
+    print(f"CuPy full (mag+angle): {cupy_full_time*1000:8.3f} ms")
+    print()
+    print(f"{'Tile':>5} | {'Row-view(ms)':>12} | {'vs CuPy':>8} | {'max diff':>10}")
+    print("─" * 48)
+    for r in results_rv:
+        print(f"{r['tile_size']:>5} | {r['row_view_time_seconds']*1000:>12.3f} | "
+              f"{r['speedup_rv_vs_cupy_full']:>8.3f}× | "
+              f"{r['max_abs_diff_vs_cpu']:>10.6f}")
+    print(f"\nCSV → {csv_rv}")
 
 
 if __name__ == "__main__":
