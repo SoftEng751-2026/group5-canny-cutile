@@ -9,15 +9,18 @@ import cupy as cp
 import numpy as np
 
 from cutile_full_pipeline import run as canny_run_full_gpu
+from cutile_canny_pipeline_benchmark import canny_pipeline_gpu_with_input_transfer
 from gaussian_benchmark import make_gaussian_kernel
 from video_stream_demo import (
     create_video_writer,
+    double_threshold_and_hysteresis,
     frame_to_grayscale_float32,
     make_source_tag,
     open_frame_source,
     parse_args,
     read_next_frame,
     resize_frame,
+    select_thresholds,
 )
 
 
@@ -107,6 +110,212 @@ def gpu_full_worker(args, kernel_cpu, input_queue, result_queue, stop_event):
                 "gpu_full_seconds": stage_end - stage_start,
             }
         )
+
+
+# ── Pipelined frontend/postprocess workers (Section 6 of the notebook) ────────
+# These implement the two-stage cross-frame pipeline measured by the notebook:
+# the GPU frontend of frame K+1 runs concurrently with the CPU post-processing
+# of frame K.  This is a different design from gpu_full_worker above (which keeps
+# hysteresis on the GPU); here hysteresis stays on the CPU on purpose so the two
+# stages can overlap on separate threads.
+
+def gpu_frontend_worker(args, kernel_cpu, input_queue, post_queue, stop_event):
+    """
+    Stage 1 (pipelined): GPU/cuTile Canny frontend only.
+
+    resize -> grayscale -> Gaussian+Sobel+NMS (cuTile) -> transfer NMS to CPU.
+    The NMS magnitude image is handed to the CPU worker so threshold+hysteresis
+    for frame K can overlap with the GPU frontend of frame K+1.
+    """
+    while not stop_event.is_set():
+        item = input_queue.get()
+
+        if item is SENTINEL:
+            post_queue.put(SENTINEL)
+            break
+
+        stage_start = time.perf_counter()
+
+        resized_frame = resize_frame(item["frame_bgr"], args.resize_width)
+        image_cpu = frame_to_grayscale_float32(resized_frame)
+
+        _, _, _, nms_gpu = canny_pipeline_gpu_with_input_transfer(
+            image_cpu=image_cpu,
+            kernel_cpu=kernel_cpu,
+            tile_size=args.tile_size,
+        )
+
+        cp.cuda.Stream.null.synchronize()
+        nms_cpu = cp.asnumpy(nms_gpu)
+
+        gpu_frontend_seconds = time.perf_counter() - stage_start
+
+        post_queue.put(
+            {
+                "frame_index":          item["frame_index"],
+                "submit_time":          item["submit_time"],
+                "resized_frame":        resized_frame,
+                "nms_cpu":              nms_cpu,
+                "gpu_frontend_seconds": gpu_frontend_seconds,
+            }
+        )
+
+
+def cpu_postprocess_worker(args, post_queue, result_queue, stop_event):
+    """
+    Stage 2 (pipelined): CPU threshold + hysteresis.
+
+    Runs on its own thread so it overlaps with the GPU frontend of later frames
+    — the cross-frame pipeline parallelism Section 6 of the notebook measures.
+    """
+    while not stop_event.is_set():
+        item = post_queue.get()
+
+        if item is SENTINEL:
+            result_queue.put(SENTINEL)
+            break
+
+        stage_start = time.perf_counter()
+
+        nms_cpu = item["nms_cpu"]
+        low, high = select_thresholds(
+            nms_image=nms_cpu,
+            threshold_mode=args.threshold_mode,
+            high_percentile=args.high_percentile,
+            low_ratio=args.low_ratio,
+            low_threshold=args.low_threshold,
+            high_threshold=args.high_threshold,
+        )
+        edges_bool = double_threshold_and_hysteresis(nms_cpu, low, high)
+
+        cpu_postprocess_seconds = time.perf_counter() - stage_start
+
+        result_queue.put(
+            {
+                "frame_index":             item["frame_index"],
+                "submit_time":             item["submit_time"],
+                "resized_frame":           item["resized_frame"],
+                "edges_uint8":             edges_bool.astype(np.uint8) * 255,
+                "low_threshold":           low,
+                "high_threshold":          high,
+                "edge_pixel_ratio":        float(np.count_nonzero(edges_bool) / edges_bool.size),
+                "gpu_frontend_seconds":    item["gpu_frontend_seconds"],
+                "cpu_postprocess_seconds": cpu_postprocess_seconds,
+            }
+        )
+
+
+def run_pipeline(args, kernel_cpu):
+    """
+    Run the cross-frame pipeline and return (rows, wall_time).
+
+    Three threads run concurrently:
+      producer   -> reads frames
+      GPU worker -> resize/grayscale + cuTile Gaussian+Sobel+NMS + transfer
+      CPU worker -> threshold + hysteresis
+    The GPU frontend of frame K+1 overlaps the CPU post-processing of frame K,
+    so throughput approaches 1 / max(t_gpu, t_cpu) rather than 1 / (t_gpu + t_cpu).
+
+    rows : list of per-frame dicts containing frame_index, gpu_frontend_seconds,
+           cpu_postprocess_seconds, latency_seconds, thresholds and edge ratio.
+    wall_time : total seconds for the whole run (used to compute throughput FPS).
+    """
+    source_type, loop_frame, capture = open_frame_source(args.source, args.image_loop)
+
+    input_queue  = queue.Queue(maxsize=4)
+    post_queue   = queue.Queue(maxsize=2)   # bounded → backpressure toward CPU stage
+    result_queue = queue.Queue(maxsize=4)
+    stop_event   = threading.Event()
+
+    producer = threading.Thread(
+        target=producer_worker,
+        args=(args, source_type, loop_frame, capture, input_queue, stop_event),
+        daemon=True,
+    )
+    gpu_worker = threading.Thread(
+        target=gpu_frontend_worker,
+        args=(args, kernel_cpu, input_queue, post_queue, stop_event),
+        daemon=True,
+    )
+    cpu_worker = threading.Thread(
+        target=cpu_postprocess_worker,
+        args=(args, post_queue, result_queue, stop_event),
+        daemon=True,
+    )
+
+    video_writer = None
+    rows = []
+    processed_frames = 0
+
+    overall_start = time.perf_counter()
+
+    try:
+        producer.start()
+        gpu_worker.start()
+        cpu_worker.start()
+
+        while True:
+            item = result_queue.get()
+
+            if item is SENTINEL:
+                break
+
+            edge_bgr = cv2.cvtColor(item["edges_uint8"], cv2.COLOR_GRAY2BGR)
+
+            if video_writer is None and args.output_video is not None:
+                video_writer = create_video_writer(args.output_video, edge_bgr.shape)
+
+            if video_writer is not None:
+                video_writer.write(edge_bgr)
+
+            rows.append(
+                {
+                    "frame_index":             item["frame_index"],
+                    "gpu_frontend_seconds":    item["gpu_frontend_seconds"],
+                    "cpu_postprocess_seconds": item["cpu_postprocess_seconds"],
+                    "latency_seconds":         time.perf_counter() - item["submit_time"],
+                    "low_threshold":           item["low_threshold"],
+                    "high_threshold":          item["high_threshold"],
+                    "edge_pixel_ratio":        item["edge_pixel_ratio"],
+                }
+            )
+
+            processed_frames += 1
+
+            if not args.no_display:
+                display_frame = np.hstack((item["resized_frame"], edge_bgr))
+                elapsed = time.perf_counter() - overall_start
+                throughput_fps = processed_frames / elapsed if elapsed > 0 else 0.0
+                cv2.putText(
+                    display_frame,
+                    f"Pipelined FPS: {throughput_fps:.2f}",
+                    (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("Original | Pipelined Canny edges", display_frame)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    stop_event.set()
+                    break
+
+    finally:
+        stop_event.set()
+
+        if capture is not None:
+            capture.release()
+
+        if video_writer is not None:
+            video_writer.release()
+
+        if not args.no_display:
+            cv2.destroyAllWindows()
+
+    wall_time = time.perf_counter() - overall_start
+    return rows, wall_time
 
 
 def main():

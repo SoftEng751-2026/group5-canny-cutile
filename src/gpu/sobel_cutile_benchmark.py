@@ -285,9 +285,12 @@ def prepare_sobel_row_views(image_gpu, tile_size):
     """
     H, W = image_gpu.shape
 
-    # 1 copy: pad image by 1 pixel on all sides
-    padded = cp.pad(image_gpu, 1, mode="edge")          # (H+2) × (W+2)
-    padded = _pad_width_to_multiple(padded, tile_size)  # may copy if W+2 % ts ≠ 0
+    # 1 copy: pad 1px on top/left/right, 2px on the bottom.  The extra bottom
+    # row guards the +2 column offset of bot_flat[2:] (and +1 of bot_flat[1:])
+    # from reading past the allocation on the final tile.  The guard row is
+    # otherwise unused — its outputs land in the discarded padding columns.
+    padded = cp.pad(image_gpu, ((1, 2), (1, 1)), mode="edge")  # (H+3) × (W+2)
+    padded = _pad_width_to_multiple(padded, tile_size)         # may copy if W+2 % ts ≠ 0
     Wp = padded.shape[1]
     num_col_tiles = Wp // tile_size
 
@@ -769,9 +772,6 @@ def main():
     best_rv = None
 
     for tile_size in tile_sizes:
-        rv_t, rv_mag, rv_ang = benchmark_fused_sobel.__wrapped__(image_gpu, tile_size, args.runs, args.warmup) \
-            if hasattr(benchmark_fused_sobel, '__wrapped__') else (None, None, None)
-
         # Inline benchmark for row-view
         def _rv(): return launch_sobel_row_view(image_gpu, tile_size)
         for _ in range(args.warmup): _rv()

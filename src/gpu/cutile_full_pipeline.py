@@ -19,14 +19,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from gaussian_benchmark import load_grayscale_image, make_gaussian_kernel
-from sobel_cutile_benchmark import (
-    launch_sobel_cutile,
-    launch_sobel_fused_cutile,
-    launch_sobel_row_view,
-    sobel_magnitude_cupy_compute_only,
-)
-from nms_cutile_benchmark import launch_nms_cutile, launch_nms_row_view
-from nms_benchmark import non_max_suppression_gpu_compute_only
+from sobel_cutile_benchmark import launch_sobel_row_view
+from nms_cutile_benchmark import launch_nms_row_view
+from nms_cupy_benchmark import non_max_suppression_gpu_compute_only
 
 try:
     import cuda.tile as ct

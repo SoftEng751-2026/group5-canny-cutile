@@ -28,7 +28,7 @@ except Exception:
 
 from gaussian_benchmark import load_grayscale_image, make_gaussian_kernel
 from sobel_benchmark import normalize_to_uint8
-from nms_benchmark import (
+from nms_cupy_benchmark import (
     non_max_suppression_cpu,
     non_max_suppression_gpu_compute_only,
     benchmark_cpu_nms,
@@ -223,8 +223,10 @@ def launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size):
     H, W = magnitude_gpu.shape
 
     # ── magnitude: 1 pad copy, then 9 no-copy views ──────────────────────────
-    mag_padded = cp.pad(magnitude_gpu, 1, mode="edge")        # (H+2)×(W+2)
-    mag_padded = _pad_width_to_multiple(mag_padded, tile_size)  # (H+2)×Wp
+    # Extra bottom row (2px) guards the +2 offset of bot_flat[2:] (and +1 of
+    # bot_flat[1:]) from reading past the allocation on the final tile.
+    mag_padded = cp.pad(magnitude_gpu, ((1, 2), (1, 1)), mode="edge")  # (H+3)×(W+2)
+    mag_padded = _pad_width_to_multiple(mag_padded, tile_size)         # (H+3)×Wp
     Wp = mag_padded.shape[1]
     num_col_tiles = Wp // tile_size
     total_tiles   = H * num_col_tiles
@@ -245,12 +247,16 @@ def launch_nms_row_view(magnitude_gpu, angle_gpu, tile_size):
     mag_bl = bot_flat[0:]   # bottom-left
     mag_br = bot_flat[2:]   # bottom-right
 
-    # ── angle: normalise + width-pad (1 copy), then 1 view ───────────────────
-    # Center angle for pixel (r, c) is at position r*Wp + c in the Wp-wide
-    # layout, so no col offset is needed.
-    angle_norm = (angle_gpu % 180.0).astype(cp.float32)       # H×W, 1 copy
-    angle_wide = _pad_width_to_multiple(angle_norm, tile_size) # H×Wp
-    ang_c = angle_wide.ravel()[0:]                             # no col offset
+    # ── angle: pad identically to magnitude so the flat-layout stride (Wp) and
+    # the centre offset match mag_c exactly.  Width-padding angle on its own
+    # would round ceil(W) while magnitude rounds ceil(W+2); when those land on
+    # different multiples of tile_size (e.g. W a multiple of tile_size) the row
+    # strides diverge and the angle silently de-aligns from the magnitude
+    # centre — corrupting every output pixel.
+    angle_norm = (angle_gpu % 180.0).astype(cp.float32)            # H×W
+    ang_padded = cp.pad(angle_norm, ((1, 2), (1, 1)), mode="edge")  # (H+3)×(W+2)
+    ang_padded = _pad_width_to_multiple(ang_padded, tile_size)      # (H+3)×Wp
+    ang_c = ang_padded[1:H+1, :].ravel()[1:]                        # = angle(r, c)
 
     # ── kernel launch ─────────────────────────────────────────────────────────
     out_flat = cp.zeros(total_tiles * tile_size, dtype=cp.float32)

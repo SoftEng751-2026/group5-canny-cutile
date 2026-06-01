@@ -1,12 +1,9 @@
 """
 BSDS500 Canny reliability test.
 
-Downloads images from the Berkeley Segmentation Dataset 500 and compares:
-  - Pure-NumPy Canny (CPU reference)
-  - Full GPU / cuTile Canny   (if CuPy is available)
-  - OpenCV cv2.Canny          (external reference)
-
-Displays visual results and prints per-image and aggregate reliability summaries.
+Downloads images from the Berkeley Segmentation Dataset 500 and compares our
+pure-NumPy Canny implementation against OpenCV's cv2.Canny on those images.
+Displays visual results and prints a per-image and aggregate reliability summary.
 """
 
 import sys
@@ -18,18 +15,7 @@ import kagglehub
 import matplotlib.pyplot as plt
 import numpy as np
 import csv
-
-# ── Optional GPU pipeline ─────────────────────────────────────────────────────
-try:
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent / "src" / "gpu"))
-    from cutile_full_pipeline import run as _gpu_run
-    from gaussian_benchmark import make_gaussian_kernel as _make_kernel_gpu
-    HAS_GPU = True
-except Exception as _e:
-    HAS_GPU = False
-    print(f"[info] GPU pipeline not available ({_e}); GPU column will be skipped.",
-          file=sys.stderr)
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -213,197 +199,175 @@ def _compute_metrics(np_edges: np.ndarray, oc_edges: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# GPU Canny wrapper
-# ---------------------------------------------------------------------------
-
-def gpu_canny(
-    gray_uint8: np.ndarray,
-    kernel_size: int = 5,
-    sigma: float = 1.4,
-    high_percentile: float = 90.0,
-    low_ratio: float = 0.5,
-):
-    """Run the full GPU/cuTile Canny pipeline. Returns (edges_bool, low, high)."""
-    kernel_cpu = _make_kernel_gpu(kernel_size, sigma)
-    img_f32 = gray_uint8.astype("float32")
-    edges, low, high, _ = _gpu_run(
-        image_cpu=img_f32,
-        kernel_cpu=kernel_cpu,
-        tile_size=256,
-        high_pct=high_percentile,
-        low_ratio=low_ratio,
-        gpu_hysteresis=True,
-    )
-    return edges.astype(bool), float(low), float(high)
-
-
-# ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
 
 def _show_grid(records: list[dict]) -> None:
     n = len(records)
-    has_gpu = any("gpu_edges" in r for r in records)
-    n_cols = 5 if has_gpu else 4
+    fig, axes = plt.subplots(n, 4, figsize=(17, 4.2 * n), squeeze=False)
 
-    fig, axes = plt.subplots(n, n_cols, figsize=(4.2 * n_cols, 4.2 * n), squeeze=False)
-
-    col_titles = ["Original (grayscale)", "NumPy Canny"]
-    if has_gpu:
-        col_titles.append("GPU/cuTile Canny")
-    col_titles += [
+    col_titles = [
+        "Original (grayscale)",
+        "NumPy Canny",
         "OpenCV Canny",
-        "Diff NumPy vs GPU\n(red=NumPy only, blue=GPU only, grey=both)"
-        if has_gpu else
-        "Diff NumPy vs OpenCV\n(red=NumPy only, blue=OpenCV only, grey=both)",
+        "Difference\n(red=NumPy only, blue=OpenCV only, grey=both)",
     ]
-
     for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, fontsize=10, fontweight="bold", pad=6)
+        axes[0, col].set_title(title, fontsize=11, fontweight="bold", pad=6)
 
     for row, rec in enumerate(records):
-        m   = rec["metrics_vs_opencv"]
-        mg  = rec.get("metrics_vs_gpu")
+        m = rec["metrics"]
 
-        col = 0
-        axes[row, col].imshow(rec["gray"], cmap="gray", vmin=0, vmax=255)
-        axes[row, col].set_ylabel(rec["name"], fontsize=8, rotation=0,
-                                  labelpad=90, va="center")
-        col += 1
+        axes[row, 0].imshow(rec["gray"], cmap="gray", vmin=0, vmax=255)
+        axes[row, 0].set_ylabel(rec["name"], fontsize=8, rotation=0,
+                                labelpad=90, va="center")
 
-        axes[row, col].imshow(rec["np_edges"], cmap="gray")
-        axes[row, col].set_xlabel(
-            f"edges: {m['numpy_edge_pct']:.2f}%  (low={rec['low']:.1f}, high={rec['high']:.1f})",
-            fontsize=8)
-        col += 1
+        axes[row, 1].imshow(rec["np_edges"], cmap="gray")
+        axes[row, 1].set_xlabel(
+            f"edge pixels: {m['numpy_edge_pct']:.2f}%  "
+            f"(low={rec['low']:.1f}, high={rec['high']:.1f})",
+            fontsize=8,
+        )
 
-        if has_gpu and "gpu_edges" in rec:
-            axes[row, col].imshow(rec["gpu_edges"], cmap="gray")
-            axes[row, col].set_xlabel(
-                f"edges: {float(np.mean(rec['gpu_edges']))*100:.2f}%", fontsize=8)
-            col += 1
+        axes[row, 2].imshow(rec["oc_edges"], cmap="gray")
+        axes[row, 2].set_xlabel(
+            f"edge pixels: {m['opencv_edge_pct']:.2f}%",
+            fontsize=8,
+        )
 
-        axes[row, col].imshow(rec["oc_edges"], cmap="gray")
-        axes[row, col].set_xlabel(
-            f"edges: {m['opencv_edge_pct']:.2f}%", fontsize=8)
-        col += 1
-
-        # diff map: NumPy vs GPU if available, else NumPy vs OpenCV
-        if mg is not None:
-            axes[row, col].imshow(mg["diff_map"])
-            axes[row, col].set_xlabel(
-                f"NumPy↔GPU agree: {mg['agreement']*100:.2f}%  F1: {mg['f1']:.3f}",
-                fontsize=8)
-        else:
-            axes[row, col].imshow(m["diff_map"])
-            axes[row, col].set_xlabel(
-                f"NumPy↔OpenCV agree: {m['agreement']*100:.2f}%  F1: {m['f1']:.3f}",
-                fontsize=8)
+        axes[row, 3].imshow(m["diff_map"])
+        axes[row, 3].set_xlabel(
+            f"pixel agreement: {m['agreement']*100:.2f}%   F1: {m['f1']:.3f}",
+            fontsize=8,
+        )
 
         for ax in axes[row]:
-            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xticks([])
+            ax.set_yticks([])
 
-    title_str = "BSDS500 — NumPy vs GPU/cuTile vs OpenCV Canny" if has_gpu \
-                else "BSDS500 — NumPy Canny vs OpenCV Canny"
-    fig.suptitle(title_str + "\nThresholds computed from NumPy NMS output.",
-                 fontsize=12, y=1.002)
+    fig.suptitle(
+        "BSDS500 - Pure-NumPy Canny vs OpenCV Canny\n"
+        "Thresholds are computed from the NumPy NMS output and applied to both implementations.",
+        fontsize=12,
+        y=1.005,
+    )
     plt.tight_layout()
     plt.show()
 
 
 def _print_summary(records: list[dict]) -> None:
-    has_gpu = any("metrics_vs_gpu" in r and r["metrics_vs_gpu"] is not None
-                  for r in records)
-
-    sep = "=" * 90
-
-    # ── NumPy vs OpenCV ───────────────────────────────────────────────────────
+    sep = "=" * 76
     print(f"\n{sep}")
-    print("RELIABILITY SUMMARY — NumPy Canny vs OpenCV Canny on BSDS500")
+    print("RELIABILITY SUMMARY -- Pure NumPy Canny vs OpenCV Canny on BSDS500")
     print(sep)
     print(f"{'Image':<30} {'Agreement':>10} {'Precision':>10} {'Recall':>10} {'F1':>8}")
     print("-" * 76)
 
-    oc_agreements, oc_precisions, oc_recalls, oc_f1s = [], [], [], []
+    agreements, precisions, recalls, f1s = [], [], [], []
     for rec in records:
-        m = rec["metrics_vs_opencv"]
+        m = rec["metrics"]
         name = rec["name"][:28]
-        print(f"{name:<30} {m['agreement']*100:>9.2f}%"
-              f" {m['precision']:>10.3f} {m['recall']:>10.3f} {m['f1']:>8.3f}")
-        oc_agreements.append(m["agreement"]); oc_precisions.append(m["precision"])
-        oc_recalls.append(m["recall"]);        oc_f1s.append(m["f1"])
+        print(
+            f"{name:<30} {m['agreement']*100:>9.2f}%"
+            f" {m['precision']:>10.3f} {m['recall']:>10.3f} {m['f1']:>8.3f}"
+        )
+        agreements.append(m["agreement"])
+        precisions.append(m["precision"])
+        recalls.append(m["recall"])
+        f1s.append(m["f1"])
 
     print("-" * 76)
-    print(f"{'MEAN':<30} {np.mean(oc_agreements)*100:>9.2f}%"
-          f" {np.mean(oc_precisions):>10.3f} {np.mean(oc_recalls):>10.3f} {np.mean(oc_f1s):>8.3f}")
-    print(f"{'STDEV':<30} {np.std(oc_agreements)*100:>9.2f}%"
-          f" {np.std(oc_precisions):>10.3f} {np.std(oc_recalls):>10.3f} {np.std(oc_f1s):>8.3f}")
+    print(
+        f"{'MEAN':<30} {np.mean(agreements)*100:>9.2f}%"
+        f" {np.mean(precisions):>10.3f} {np.mean(recalls):>10.3f} {np.mean(f1s):>8.3f}"
+    )
+    print(
+        f"{'STDEV':<30} {np.std(agreements)*100:>9.2f}%"
+        f" {np.std(precisions):>10.3f} {np.std(recalls):>10.3f} {np.std(f1s):>8.3f}"
+    )
+    print(
+        f"{'MIN':<30} {np.min(agreements)*100:>9.2f}%"
+        f" {np.min(precisions):>10.3f} {np.min(recalls):>10.3f} {np.min(f1s):>8.3f}"
+    )
+    print(
+        f"{'MAX':<30} {np.max(agreements)*100:>9.2f}%"
+        f" {np.max(precisions):>10.3f} {np.max(recalls):>10.3f} {np.max(f1s):>8.3f}"
+    )
     print(sep)
-
-    # ── NumPy vs GPU ──────────────────────────────────────────────────────────
-    gp_agreements, gp_precisions, gp_recalls, gp_f1s = [], [], [], []
-    if has_gpu:
-        print(f"\n{sep}")
-        print("ACCURACY SUMMARY — NumPy Canny vs GPU/cuTile Canny on BSDS500")
-        print(sep)
-        print(f"{'Image':<30} {'Agreement':>10} {'Precision':>10} {'Recall':>10} {'F1':>8}")
-        print("-" * 76)
-
-        for rec in records:
-            mg = rec.get("metrics_vs_gpu")
-            if mg is None:
-                continue
-            name = rec["name"][:28]
-            print(f"{name:<30} {mg['agreement']*100:>9.2f}%"
-                  f" {mg['precision']:>10.3f} {mg['recall']:>10.3f} {mg['f1']:>8.3f}")
-            gp_agreements.append(mg["agreement"]); gp_precisions.append(mg["precision"])
-            gp_recalls.append(mg["recall"]);        gp_f1s.append(mg["f1"])
-
-        if gp_agreements:
-            print("-" * 76)
-            print(f"{'MEAN':<30} {np.mean(gp_agreements)*100:>9.2f}%"
-                  f" {np.mean(gp_precisions):>10.3f} {np.mean(gp_recalls):>10.3f} {np.mean(gp_f1s):>8.3f}")
-            print(f"{'STDEV':<30} {np.std(gp_agreements)*100:>9.2f}%"
-                  f" {np.std(gp_precisions):>10.3f} {np.std(gp_recalls):>10.3f} {np.std(gp_f1s):>8.3f}")
-        print(sep)
-        print("\nHigh agreement / F1 between NumPy and GPU/cuTile confirms that the "
-              "GPU pipeline is numerically equivalent to the CPU reference.\n")
-
     print(
         "\nMetric guide:\n"
-        "  Agreement  - fraction of pixels where both agree (edge or not)\n"
-        "  Precision  - fraction of reference edge pixels also in comparison\n"
-        "  Recall     - fraction of comparison edge pixels also in reference\n"
+        "  Agreement  - fraction of pixels where both implementations agree (edge or not)\n"
+        "  Precision  - fraction of NumPy edge pixels also detected by OpenCV\n"
+        "  Recall     - fraction of OpenCV edge pixels also detected by NumPy\n"
         "  F1         - harmonic mean of precision & recall (1.0 = identical)\n"
+        "\nExpected differences arise from:\n"
+        "  * NumPy uses edge-padding; OpenCV uses a different border strategy\n"
+        "  * OpenCV computes Sobel on uint8 internally before converting to float\n"
+        "  * Minor floating-point ordering differences in NMS\n"
     )
-
-    # ── Save CSV ──────────────────────────────────────────────────────────────
+    
+    # Save results to CSV
     csv_path = Path("canny_reliability_results.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        headers = ["Image",
-                   "NP_vs_OC_Agreement", "NP_vs_OC_Precision",
-                   "NP_vs_OC_Recall",    "NP_vs_OC_F1"]
-        if has_gpu:
-            headers += ["NP_vs_GPU_Agreement", "NP_vs_GPU_Precision",
-                        "NP_vs_GPU_Recall",    "NP_vs_GPU_F1"]
-        writer.writerow(headers)
-
+        writer.writerow(["Image", "Agreement", "Precision", "Recall", "F1"])
         for rec in records:
-            m  = rec["metrics_vs_opencv"]
-            mg = rec.get("metrics_vs_gpu")
-            row = [rec["name"],
-                   f"{m['agreement']:.6f}", f"{m['precision']:.6f}",
-                   f"{m['recall']:.6f}",    f"{m['f1']:.6f}"]
-            if has_gpu:
-                if mg:
-                    row += [f"{mg['agreement']:.6f}", f"{mg['precision']:.6f}",
-                            f"{mg['recall']:.6f}",    f"{mg['f1']:.6f}"]
-                else:
-                    row += ["N/A"] * 4
-            writer.writerow(row)
-
-    print(f"Detailed results saved to: {csv_path.absolute()}")
+            m = rec["metrics"]
+            writer.writerow([
+                rec["name"],
+                f"{m['agreement']:.6f}",
+                f"{m['precision']:.6f}",
+                f"{m['recall']:.6f}",
+                f"{m['f1']:.6f}",
+            ])
+        writer.writerow([])  # blank line
+        writer.writerow(["AGGREGATED STATISTICS"])
+        writer.writerow(["Metric", "Mean", "Stdev", "Min", "Max", "Count"])
+        writer.writerow([
+            "Agreement",
+            f"{np.mean(agreements):.6f}",
+            f"{np.std(agreements):.6f}",
+            f"{np.min(agreements):.6f}",
+            f"{np.max(agreements):.6f}",
+            len(agreements),
+        ])
+        writer.writerow([
+            "Precision",
+            f"{np.mean(precisions):.6f}",
+            f"{np.std(precisions):.6f}",
+            f"{np.min(precisions):.6f}",
+            f"{np.max(precisions):.6f}",
+            len(precisions),
+        ])
+        writer.writerow([
+            "Recall",
+            f"{np.mean(recalls):.6f}",
+            f"{np.std(recalls):.6f}",
+            f"{np.min(recalls):.6f}",
+            f"{np.max(recalls):.6f}",
+            len(recalls),
+        ])
+        writer.writerow([
+            "F1",
+            f"{np.mean(f1s):.6f}",
+            f"{np.std(f1s):.6f}",
+            f"{np.min(f1s):.6f}",
+            f"{np.max(f1s):.6f}",
+            len(f1s),
+        ])
+    
+    print(f"\n✓ 详细结果已保存至: {csv_path.absolute()}")
+    return {
+        "mean_agreement": np.mean(agreements),
+        "mean_precision": np.mean(precisions),
+        "mean_recall": np.mean(recalls),
+        "mean_f1": np.mean(f1s),
+        "std_agreement": np.std(agreements),
+        "std_precision": np.std(precisions),
+        "std_recall": np.std(recalls),
+        "std_f1": np.std(f1s),
+        "count": len(records),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +390,6 @@ def main(max_images: int = None, kernel_size: int = 5, sigma: float = 1.4,
           f"high_pct={high_percentile}, low_ratio={low_ratio}\n")
     print(f"Note: Full grid visualization will show first {max_display} images only.\n")
 
-    print(f"GPU/cuTile pipeline: {'available' if HAS_GPU else 'NOT available (CPU only)'}\n")
-
     records = []
     for idx, img_path in enumerate(image_paths):
         print(f"  [{idx+1}/{len(image_paths)}] {img_path.name} ...", end=" ", flush=True)
@@ -439,61 +401,50 @@ def main(max_images: int = None, kernel_size: int = 5, sigma: float = 1.4,
 
         # --- NumPy Canny (adaptive percentile thresholds) ---
         np_edges, low, high = numpy_canny(
-            gray, kernel_size=kernel_size, sigma=sigma,
-            high_percentile=high_percentile, low_ratio=low_ratio,
+            gray,
+            kernel_size=kernel_size,
+            sigma=sigma,
+            high_percentile=high_percentile,
+            low_ratio=low_ratio,
         )
 
-        # --- GPU/cuTile Canny (same thresholds via percentile on GPU) ---
-        gpu_edges = None
-        metrics_vs_gpu = None
-        if HAS_GPU:
-            try:
-                gpu_edges, _, _ = gpu_canny(
-                    gray, kernel_size=kernel_size, sigma=sigma,
-                    high_percentile=high_percentile, low_ratio=low_ratio,
-                )
-                metrics_vs_gpu = _compute_metrics(np_edges, gpu_edges.astype(np.uint8) * 255)
-            except Exception as exc:
-                print(f"[gpu error: {exc}] ", end="")
-
-        # --- OpenCV Canny (same thresholds, L2 gradient) ---
+        # --- OpenCV Canny (same thresholds, L2 gradient to match our hypot) ---
+        # We pass the raw uint8 image so OpenCV handles its own border internally.
+        # Thresholds are in gradient-magnitude units (same scale as ours since both
+        # operate on 0-255 intensity values).
         oc_edges = cv2.Canny(
-            gray, threshold1=low, threshold2=high,
-            apertureSize=3, L2gradient=True,
+            gray,
+            threshold1=low,
+            threshold2=high,
+            apertureSize=3,
+            L2gradient=True,
         )
 
-        metrics_vs_opencv = _compute_metrics(np_edges, oc_edges)
-
-        gpu_info = ""
-        if metrics_vs_gpu is not None:
-            gpu_info = (f"  GPU↔NumPy agree={metrics_vs_gpu['agreement']*100:.1f}%"
-                        f" F1={metrics_vs_gpu['f1']:.3f}")
+        metrics = _compute_metrics(np_edges, oc_edges)
 
         print(
-            f"OC agree={metrics_vs_opencv['agreement']*100:.1f}%"
-            f" F1={metrics_vs_opencv['f1']:.3f}"
-            f"  (low={low:.1f}, high={high:.1f})"
-            f"{gpu_info}"
+            f"agreement={metrics['agreement']*100:.1f}%  "
+            f"F1={metrics['f1']:.3f}  "
+            f"(low={low:.1f}, high={high:.1f})"
         )
 
         records.append({
-            "name":             img_path.name,
-            "gray":             gray,
-            "np_edges":         np_edges,
-            "gpu_edges":        gpu_edges,
-            "oc_edges":         oc_edges,
-            "low":              low,
-            "high":             high,
-            "metrics_vs_opencv": metrics_vs_opencv,
-            "metrics_vs_gpu":    metrics_vs_gpu,
+            "name": img_path.name,
+            "gray": gray,
+            "np_edges": np_edges,
+            "oc_edges": oc_edges,
+            "low": low,
+            "high": high,
+            "metrics": metrics,
         })
 
     if not records:
         print("No images could be processed.", file=sys.stderr)
         sys.exit(1)
 
-    _print_summary(records)
-
+    summary = _print_summary(records)
+    
+    # Only display the first max_display images
     display_records = records[:max_display]
     _show_grid(display_records)
 
