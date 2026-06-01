@@ -1,147 +1,310 @@
 # group5-canny-cutile
-Canny Edge Detection implementation with cuTile for SoftEng 751 2026
 
+Canny Edge Detection accelerated with [cuTile](https://docs.nvidia.com/cuda/cutile-python/) —
+NVIDIA's Python DSL for tile-parallel GPU programming.
+**SoftEng 751, Group 5, 2026.**
 
-## 项目分工
-- jiaxi liu:  cuTile GPU 实现 + 实时视频
-- xudong ma :纯 Python Baseline + 性能测试 + 报告素材
-- shiying yang: 依赖分析、参数优化、集成
+Team: Jiaxi Liu · Xudong Ma · Shiying Yang
 
-## 当前进度 (2026.4)
-- ✅ 纯 Python Canny Baseline 已完成（包含所有步骤 + 中间结果可视化 + Benchmark）
-- 测试图片位于 `data/` 文件夹
-- 中间结果保存在 `report/` 文件夹
+---
 
-## 如何运行 Baseline
+## What this project implements
 
-```bash
-# 1. 激活环境
-.venv\Scripts\activate
+A complete, GPU-accelerated Canny edge-detection pipeline with three layers of parallelism:
 
-# 2. 安装依赖
-pip install -r requirement.txt
+| Layer | Where | Mechanism |
+|:---|:---|:---|
+| **Pixel-level data parallelism** | Gaussian / Sobel / NMS | `N_blocks = pixels / tile_size` blocks run concurrently on GPU SMs |
+| **cuTile fused kernels** | Sobel (row-view) / NMS (row-view) / Gaussian | One pass reads neighbours as zero-copy column-offset views, writes mag+gx+gy; eliminates 8–9 full-image copies |
+| **Cross-frame pipeline parallelism** | Video stream | GPU frontend of frame K+1 overlaps CPU post-processing of frame K via `threading` |
 
-# 3. 运行 Jupyter Notebook
-jupyter notebook
+The stage-4/5 improvement moves `threshold + hysteresis` from CPU (OpenCV connected components)
+to GPU (`cupyx.scipy.ndimage.label`), eliminating the Amdahl bottleneck identified in the
+analysis notebook.
+
+---
+
+## Pipeline
+
+```
+Input image
+    │
+    ▼
+[1] Gaussian blur (k=5, σ=1.4)
+    ├─ cuTile fused 5-tap kernel  (k=5 only; CuPy fallback for other sizes)
+    │
+    ▼
+[2] Sobel gradient (mag + gx + gy)
+    ├─ cuTile row-view fused kernel  (1 pad copy → 8 zero-copy col-offset views)
+    │   → writes magnitude, gx, gy in one pass; CuPy fallback
+    │
+    ▼
+[3] Non-Maximum Suppression
+    ├─ cuTile row-view kernel  (1 pad copy → 9 zero-copy views; CuPy fallback)
+    │
+    ▼
+[4] Double threshold  (percentile-based or fixed)
+    ├─ CuPy (GPU)
+    │
+    ▼
+[5] Hysteresis
+    ├─ GPU: cupyx.scipy.ndimage.label  ← default, removes the Amdahl bottleneck
+    └─ CPU: OpenCV connectedComponents ← --cpu-hysteresis flag, kept for comparison
+    │
+    ▼
+Output edge image (bool / uint8)
 ```
 
 ---
 
-## Overview
-
-This project implements Canny edge detection optimised with [cuTile](https://docs.nvidia.com/cuda/cutile-python/), NVIDIA's Python DSL for tile-parallel GPU programming, developed for SoftEng 751.
-
-## Pipeline Architecture
-
-| Stage | Implementation | Notes |
-|-------|---------------|-------|
-| Gaussian blur | **cuTile** (k=5) / CuPy fallback | Separable 1D passes |
-| Sobel magnitude | **cuTile** / CuPy fallback | 3×3 stencil via neighbour arrays |
-| Sobel angle | CuPy | Required for NMS direction |
-| Non-maximum suppression | CuPy | Boolean mask operations |
-| Double threshold | NumPy | Percentile-based or fixed |
-| Hysteresis | CPU — OpenCV connected components | Inherently sequential |
-
-Gaussian blur and Sobel magnitude are implemented as cuTile kernels using a shared design pattern: neighbouring pixel arrays are pre-extracted and flattened to 1D before the kernel launch, so each tile operates on fully independent data with no inter-tile dependencies.  NMS and later stages run on CuPy or CPU; hysteresis is kept on CPU because the BFS graph traversal does not map cleanly to the tile execution model.
-
-## File Structure
+## File structure
 
 ```
 notebooks/
-  01_canny_baseline.ipynb          Pure NumPy Canny baseline with visualisation
+  evaluate_performance_en.ipynb   ← PRIMARY analysis notebook (English, live benchmarks)
+  evaluate_performance.ipynb      ← Chinese companion notebook
+  01_canny_baseline 1.ipynb       ← Pure NumPy Canny baseline with visualisation
+  pure_numpy_fixed .ipynb         ← Fixed pure-NumPy version (debugging reference)
+
 src/gpu/
-  cutile_full_pipeline.py          Complete pipeline (cuTile + CuPy + CPU)
-  sobel_cutile_benchmark.py        cuTile Sobel kernel + tile-size sweep
-  gaussian_benchmark.py            CuPy Gaussian vs CPU benchmark
-  sobel_benchmark.py               CuPy Sobel vs CPU benchmark
-  canny_frontend_benchmark.py      Gaussian + Sobel frontend benchmark
-  cutile_canny_pipeline_benchmark.py  Pipeline through NMS benchmark
-  complete_canny_benchmark.py      Full pipeline benchmark (all stages)
-  video_stream_demo.py             Real-time video stream demo
-  canny_pipeline.py                CuPy reference pipeline
-bsds500_canny_test.py              Reliability test vs OpenCV on BSDS500
-report/                            Benchmark CSVs, output images, analysis notes
-data/                              Sample images
+  ── Pipeline ──────────────────────────────────────────────────────────────────
+  cutile_full_pipeline.py         End-to-end Canny: cuTile stages 1-3,
+                                  GPU or CPU stage 4-5; CLI entry point
+
+  ── cuTile kernels & benchmarks ───────────────────────────────────────────────
+  sobel_cutile_benchmark.py       Three Sobel variants:
+                                    • launch_sobel_cutile      (old: 8 full copies)
+                                    • launch_sobel_fused_cutile (fused, still copies)
+                                    • launch_sobel_row_view    ← pipeline uses this
+                                  Tile-size sweep; produces report/17*, 29*, 31* CSVs
+
+  nms_cutile_benchmark.py         Two NMS variants:
+                                    • launch_nms_cutile        (old: 9 full copies)
+                                    • launch_nms_row_view      ← pipeline uses this
+                                  Tile-size sweep; produces report/27*, 32* CSVs
+
+  ── CuPy baseline benchmarks ──────────────────────────────────────────────────
+  gaussian_benchmark.py           CuPy Gaussian vs CPU; load_grayscale_image,
+                                  make_gaussian_kernel (shared utilities)
+  sobel_benchmark.py              CuPy Sobel vs CPU; normalize_to_uint8 utility
+  nms_cupy_benchmark.py           CuPy NMS vs CPU
+  canny_frontend_benchmark.py     Gaussian + Sobel frontend benchmark
+  cutile_canny_pipeline_benchmark.py  Gaussian + Sobel + NMS pipeline benchmark;
+                                  produces report/19* CSVs
+  complete_canny_benchmark.py     Full pipeline (all 5 stages) CPU vs GPU benchmark;
+                                  produces report/22* CSVs
+
+  ── Video demos ───────────────────────────────────────────────────────────────
+  video_stream_demo.py            Sequential per-frame Canny demo
+                                  (camera / video file / image-loop);
+                                  produces report/25* CSVs
+  video_stream_pipeline_demo.py   Cross-frame pipelined demo: GPU frontend thread
+                                  overlaps CPU postprocess thread;
+                                  exposes run_pipeline() used by the notebook
+
+  ── Learning / reference ──────────────────────────────────────────────────────
+  vector_add_cutile.py            Minimal cuTile hello-world (vector add)
+
+bsds500_canny_test.py             Correctness test: runs the pipeline on all 200
+                                  BSDS500 test images and compares against OpenCV Canny
+
+data/
+  test.jpg        512×512 test image (tile-aligned; used for quick benchmarks)
+  IMG_6860.JPG    3024×4032 large image (12.2 MP; used for large-scale benchmarks)
+  size.jpg        Reference photo for the controlled size-sweep experiment (§3 notebook)
+
+report/
+  ── Benchmark CSVs ────────────────────────────────────────────────────────────
+  17_sobel_cutile_tile_sweep_*    cuTile Sobel (old copy-based) tile-size sweep
+  27_nms_cutile_tile_sweep_*      cuTile NMS  (old copy-based) tile-size sweep
+  29_sobel_fused_tile_sweep_*     Fused Sobel: 2-pass vs fused vs CuPy
+  31_sobel_row_view_tile_sweep_*  Row-view Sobel vs CuPy  ← current implementation
+  32_nms_row_view_tile_sweep_*    Row-view NMS vs CuPy    ← current implementation
+  19_cutile_canny_pipeline_*      Gaussian+Sobel+NMS frontend speedup
+  22_complete_canny_benchmark_*   Full pipeline CPU vs GPU+CPU hybrid vs full-GPU
+  25_video_stream_fps_*           Sequential video stream FPS
+  26_video_stream_pipelined_*     Cross-frame pipelined video stream FPS
+  30_bsds500_gpu_benchmark.csv    BSDS500 per-image GPU hybrid speedup (200 images)
+  ── Output images ─────────────────────────────────────────────────────────────
+  04_suppressed.png / 05_final_edges.png   NMS and final edge maps
+  06-08_sobel_*.png                        Sobel magnitude comparisons
+  15-16_nms_*edges_*.png                   NMS CPU vs GPU edges
+  18_sobel_cutile_magnitude_*.png          Best-tile cuTile Sobel output
+  28_nms_cutile_edges_*.png                Best-tile cuTile NMS output
+  30_sobel_fused_magnitude_*.png           Fused Sobel output
 ```
 
-## How to Run
+---
 
-```bash
+## Quick start
+
+```powershell
 # Activate the virtual environment (Windows)
-.venv\Scripts\activate
+.venv\Scripts\activate        # or: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirement.txt
 
-# Complete cuTile pipeline on a single image
+# Run the complete cuTile pipeline on a single image (displays result)
+$env:PYTHONPATH = "src/gpu"
 python src/gpu/cutile_full_pipeline.py --image data/test.jpg
 
-# Benchmark with 10 timed runs (no GUI window)
-python src/gpu/cutile_full_pipeline.py --image data/test.jpg --runs 10 --no-display
+# Benchmark mode: 10 timed runs, no GUI, save edge output
+python src/gpu/cutile_full_pipeline.py --image data/test.jpg --runs 10 --no-display --output report/edges.png
 
-# Explore tile sizes and save edge output
-python src/gpu/cutile_full_pipeline.py --image data/test.jpg --tile-size 128 --output report/edges.png --no-display
-
-# Real-time webcam demo
-python src/gpu/video_stream_demo.py --source 0
-
-# Video demo using a static image as a fake stream (no webcam needed)
-python src/gpu/video_stream_demo.py --image-loop data/test.jpg --max-frames 30 --no-display
-
-# Experimental pipeline-parallel video demo
-python src/gpu/video_stream_pipeline_demo.py --source 0 --max-frames 100 --resize-width 512 --tile-size 256 --results-csv report/video_pipeline_camera_test.csv
-
-# Repeatable image-loop test for the pipelined video demo
-python src/gpu/video_stream_pipeline_demo.py --image-loop data/IMG_6860.JPG --max-frames 30 --resize-width 512 --tile-size 256 --no-display --results-csv report/video_pipeline_test.csv
-
-# Individual stage benchmarks
-python src/gpu/sobel_cutile_benchmark.py --tile-sizes 64,128,256,512 --runs 30
-python src/gpu/complete_canny_benchmark.py --image data/test.jpg
+# Try a different tile size (64, 128, 256, 512 are tested in the notebooks)
+python src/gpu/cutile_full_pipeline.py --image data/IMG_6860.JPG --tile-size 128 --no-display
 ```
 
+---
 
-## Experimental Pipeline-Parallel Video Demo
+## Running benchmarks
 
-`src/gpu/video_stream_pipeline_demo.py` explores pipeline parallelism across video frames. The original `video_stream_demo.py` processes one frame through the full Canny pipeline before moving to the next frame. The pipelined version separates the work into three stages:
+All benchmark scripts run from the repo root with `PYTHONPATH=src/gpu`.
 
-1. Producer: reads frames from a camera, video file, or image loop.
-2. GPU worker: performs resize, grayscale conversion, Gaussian blur, Sobel gradient, and NMS.
-3. CPU post-processing: performs double thresholding, hysteresis, display, and optional video writing.
+```powershell
+$env:PYTHONPATH = "src/gpu"
 
-This allows the GPU frontend for frame N+1 to overlap with CPU thresholding and hysteresis for frame N. This is pipeline parallelism across frames, while the Gaussian/Sobel/NMS stages still use data parallelism within each frame.
+# Sobel cuTile tile-size sweep (produces report/17*, 29*, 31* CSVs + PNGs)
+python src/gpu/sobel_cutile_benchmark.py --image data/IMG_6860.JPG --tile-sizes 64,128,256,512
 
-Example results on our test machine:
+# NMS cuTile tile-size sweep (produces report/27*, 32* CSVs + PNGs)
+python src/gpu/nms_cutile_benchmark.py --image data/IMG_6860.JPG --tile-sizes 64,128,256,512
 
-| Test | Result |
-|---|---|
-| Sequential image-loop demo, 30 frames | 9.36 FPS |
-| Pipelined image-loop demo, 30 frames | 39.57 throughput FPS |
-| Pipelined camera demo, 100 frames | 22.79 throughput FPS |
+# Gaussian + Sobel + NMS pipeline sweep (produces report/19* CSVs)
+python src/gpu/cutile_canny_pipeline_benchmark.py --image data/IMG_6860.JPG
 
+# Full pipeline benchmark — CPU vs GPU+CPU hybrid vs full-GPU (produces report/22* CSVs)
+python src/gpu/complete_canny_benchmark.py --image data/test.jpg
 
-## cuTile Implementation Details
+# BSDS500 correctness + speed test (downloads dataset automatically)
+python bsds500_canny_test.py
+```
 
-### Gaussian Blur
+---
 
-The separable Gaussian blur runs two cuTile passes (horizontal then vertical). Each pass pre-extracts `k` shifted views of the image and passes them as separate 1D arrays to the kernel, which computes the weighted sum tile-by-tile. Only k=5 uses the cuTile kernel; other sizes fall back to CuPy automatically.
+## Video stream demos
 
-### Sobel Magnitude
+```powershell
+$env:PYTHONPATH = "src/gpu"
 
-Eight 3×3 neighbour arrays are extracted from the blurred image interior and flattened to 1D. The cuTile kernel computes `sqrt(Gx² + Gy²)` for each interior pixel with no inter-tile dependencies. A tile-size sweep (64, 128, 256, 512) is benchmarked in `sobel_cutile_benchmark.py`; results are written to `report/17_sobel_cutile_tile_sweep_*.csv`.
+# Sequential demo — webcam
+python src/gpu/video_stream_demo.py --source 0 --max-frames 100
 
-### Hardware Note
+# Sequential demo — image loop (no webcam needed)
+python src/gpu/video_stream_demo.py --image-loop data/test.jpg --max-frames 50 --no-display
 
-The cuTile Sobel kernel requires Turing architecture or newer (RTX 20-series+). On Pascal GPUs (GTX 10-series) the kernel falls back to an equivalent CuPy implementation automatically. See git commit `07f36ca` for details.
+# Cross-frame pipelined demo — image loop
+python src/gpu/video_stream_pipeline_demo.py --image-loop data/test.jpg --max-frames 100 --no-display --results-csv report/pipeline_test.csv
+```
 
-## Benchmark Results
+---
 
-Benchmark CSVs and output images are written to `report/`:
+## Analysis notebooks
 
-| File pattern | Content |
-|---|---|
-| `17_sobel_cutile_tile_sweep_*` | cuTile Sobel tile-size sweep |
-| `19_cutile_canny_pipeline_*` | Gaussian + Sobel + NMS pipeline |
-| `22_complete_canny_benchmark_*` | Full Canny (all stages) CPU vs GPU |
-| `25_video_stream_fps_*` | Real-time video stream FPS |
+### `notebooks/evaluate_performance_en.ipynb` — primary notebook
 
-For a detailed analysis of data dependencies, parallelism ratings, and memory access patterns for each stage, see `report/dependency_analysis.md`.
+**Run all cells from top to bottom.** Every figure is generated live; no pre-existing CSV is
+read. All stages are exercised through the project's own functions — nothing is re-implemented
+inside the notebook.
+
+The notebook has 9 sections:
+
+| § | Title | What is evaluated |
+|:---|:---|:---|
+| 1 | **Pixel-level data parallelism** | Structural relationship between image size, tile size, and `N_blocks`; plotted from actual image pixel counts |
+| 2 | **Tile size as the parallel-granularity knob** | All three cuTile stages (Gaussian, Sobel, NMS) swept over tile sizes 64–1024 on a 1080p frame; each compared against its CuPy baseline; best tile size per stage identified |
+| 3 | **Image size vs GPU frontend speedup** | One real image (`data/size.jpg`) resized to 480p / 720p / 1080p / 4K — content held constant, only pixel count varies; `benchmark_cpu_pipeline` vs `benchmark_gpu_pipeline_for_tile_size`; shows speedup growing from ~3× to ~20× compute-only |
+| 4 | **Per-stage and whole-frontend CuPy vs cuTile** | Synthetic images 512²–8192² (0.26–67 MP), including non-tile-aligned widths (1500, 3000); Gaussian / Sobel / NMS individually, plus summed whole-frontend; correctness verified (max diff ≈ 0 at every size); OOM-guarded |
+| 5 | **Amdahl's law — serial hysteresis bottleneck** | `complete_canny_benchmark` functions time GPU frontend + CPU post-processing; serial fraction *f* measured live; measured speedup points plotted on the Amdahl curve; shows the CPU hysteresis caps end-to-end speedup |
+| 6 | **BSDS500 dataset benchmark** | Up to 200 real photographs (upscaled 4× to ~2.5 MP so the GPU is not overhead-bound); CPU total vs GPU+CPU hybrid; speedup distribution histogram; Amdahl curve with measured mean point |
+| 7 | **Sequential vs cross-frame pipelined video** | Uses a real video in `data/` if present, otherwise image-loop; sequential: `video_stream_demo.process_frame`; pipelined: `video_stream_pipeline_demo.run_pipeline`; measures GPU and CPU stage times per frame; compares measured FPS to theory `(t_gpu+t_cpu)/max(t_gpu,t_cpu)` |
+| 8 | **GPU stage 4-5 (our improvement)** | Directly compares `run_full_pipeline(..., gpu_hysteresis=False)` (CPU OpenCV connected components) vs `run_full_pipeline(..., gpu_hysteresis=True)` (GPU `cupyx.scipy.ndimage.label`); measures stage-4/5 cost separately and total pipeline FPS; shows that moving hysteresis to GPU removes the Amdahl bottleneck from §5 |
+| 9 | **Summary table** | All six parallelism axes collected |
+
+### `notebooks/evaluate_performance.ipynb` — Chinese companion
+
+Same sections as the English notebook, but reads pre-computed CSVs from `report/` for its plots
+(rather than running live benchmarks). Also contains an additional `§3.5` cell (added during
+development) that sweeps all three stages across synthetic image sizes and generates the same
+table and plots as §4 of the English notebook, produced live.
+
+### `notebooks/01_canny_baseline 1.ipynb`
+
+Pure NumPy Canny implementation with step-by-step intermediate visualisations. Educational
+reference; no GPU required.
+
+---
+
+## cuTile implementation notes
+
+### Row-view data layout (current, used in pipeline)
+
+Both Sobel and NMS previously allocated 8–9 separate contiguous copies of the image interior
+(one per neighbour direction), costing ~77% of total runtime on copies alone. The current
+implementation uses a **row-view layout**:
+
+1. Pad the image once: `cp.pad(img, ((1, 2), (1, 1)))` — one allocation.
+2. Extract three contiguous row-range views (`top_flat / ctr_flat / bot_flat`) — `ravel()` on
+   a C-contiguous slice is a view, zero copy.
+3. Eight (Sobel) or nine (NMS) column-offset slices (`flat[0:] / flat[1:] / flat[2:]`) are
+   also views — pointer offset only, zero copy.
+4. The same `_nms_cutile_kernel` / `sobel_fused_from_neighbors_cutile` kernel is reused
+   unchanged.
+
+The extra bottom-padding row (`((1,2),...)` instead of `((1,1),...))`) guards the `+2` column
+offset of the bottom-right view from reading past the allocation on the final tile (UB fix).
+
+Angle padding in NMS row-view uses **identical padding dimensions** as magnitude so both arrays
+share the same row stride `Wp`. Mismatched strides caused silent output corruption on
+tile-aligned image widths (e.g. 512×512) — fixed and verified (max diff = 0 on all sizes).
+
+### Gaussian
+
+The separable k=5 Gaussian runs two cuTile passes (horizontal then vertical). Each pass
+pre-extracts `k=5` shifted 1D views and computes the weighted sum tile-by-tile. Widths that are
+not multiples of `tile_size` trigger an extra column-padding copy; k≠5 falls back to CuPy.
+
+### Hardware requirement
+
+cuTile kernels require Turing architecture (RTX 20-series) or newer. The pipeline falls back
+silently to CuPy on older GPUs. Tested on NVIDIA GeForce RTX 3050 Laptop GPU (4 GB).
+
+---
+
+## Benchmark results (representative, tile_size=256, RTX 3050 Laptop)
+
+| Image | Stage | CuPy | cuTile (row-view) | Speedup |
+|:---|:---|:---|:---|:---|
+| 1024² (1 MP) | Gaussian | 1.31 ms | 0.62 ms | **2.1×** |
+| 1024² (1 MP) | Sobel | 1.58 ms | 0.79 ms | **2.0×** |
+| 1024² (1 MP) | NMS | 1.16 ms | 0.56 ms | **2.1×** |
+| 4096² (17 MP) | Gaussian | 19.3 ms | 8.9 ms | **2.2×** |
+| 4096² (17 MP) | Sobel | 23.6 ms | 11.0 ms | **2.1×** |
+| 4096² (17 MP) | NMS | 17.3 ms | 7.4 ms | **2.3×** |
+
+All max-diff values vs CuPy are 0.0000 (bit-exact on these sizes).
+
+Video stream (image-loop, 512-wide frames, 100 frames):
+
+| Mode | FPS |
+|:---|:---|
+| Sequential (`video_stream_demo.py`) | ~10 FPS |
+| Cross-frame pipelined | ~40–80 FPS (theory: `1/max(t_gpu, t_cpu)`) |
+
+---
+
+## Dependencies
+
+```
+numpy
+scipy
+matplotlib
+opencv-python
+cupy-cuda12x      # match your CUDA version
+cuda-python       # provides cuda.tile
+cupyx             # bundled with cupy
+kagglehub         # optional, for BSDS500 download
+```
+
+Install: `pip install -r requirement.txt`
