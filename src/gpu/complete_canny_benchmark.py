@@ -222,6 +222,83 @@ def benchmark_cpu(
     return (end - start) / args.runs, nms_cpu, edges_cpu, low, high
 
 
+def complete_canny_gpu_full(
+    image_cpu: np.ndarray,
+    kernel_cpu: np.ndarray,
+    tile_size: int,
+    threshold_mode: str,
+    high_percentile: float,
+    low_ratio: float,
+    low_threshold: float | None,
+    high_threshold: float | None,
+):
+    """
+    Fully GPU pipeline: GPU frontend + GPU threshold + GPU hysteresis via cupyx.
+    No NMS→CPU transfer; hysteresis runs on GPU with cupyx.scipy.ndimage.label.
+    """
+    from cupyx.scipy import ndimage as cpnd
+
+    _, _, _, nms_gpu = canny_pipeline_gpu_with_input_transfer(
+        image_cpu=image_cpu,
+        kernel_cpu=kernel_cpu,
+        tile_size=tile_size,
+    )
+
+    if threshold_mode == "fixed":
+        if low_threshold is None or high_threshold is None:
+            raise ValueError("fixed mode requires low_threshold and high_threshold")
+        low = float(low_threshold)
+        high = float(high_threshold)
+    else:
+        pos = nms_gpu[nms_gpu > 0]
+        if pos.size == 0:
+            return np.zeros(nms_gpu.shape, dtype=bool), float("inf"), float("inf")
+        high = float(cp.percentile(pos, high_percentile))
+        low = float(low_ratio * high)
+
+    strong = nms_gpu >= high
+    weak = (nms_gpu >= low) & ~strong
+    candidate = (strong | weak).astype(cp.uint8)
+    labels, n = cpnd.label(candidate, structure=cp.ones((3, 3), dtype=cp.int32))
+    keep = cp.zeros(n + 1, dtype=cp.bool_)
+    keep[cp.unique(labels[strong])] = True
+    keep[0] = False
+    edges_gpu = keep[labels]
+
+    edges_cpu = cp.asnumpy(edges_gpu)
+    nms_cpu = cp.asnumpy(nms_gpu)
+    return nms_cpu, edges_cpu, low, high
+
+
+def benchmark_gpu_full(
+    image_cpu: np.ndarray,
+    kernel_cpu: np.ndarray,
+    tile_size: int,
+    args,
+):
+    for _ in range(args.warmup):
+        complete_canny_gpu_full(
+            image_cpu, kernel_cpu, tile_size,
+            args.threshold_mode, args.high_percentile, args.low_ratio,
+            args.low_threshold, args.high_threshold,
+        )
+
+    cp.cuda.Stream.null.synchronize()
+    start = time.perf_counter()
+
+    for _ in range(args.runs):
+        nms_cpu, edges_cpu, low, high = complete_canny_gpu_full(
+            image_cpu, kernel_cpu, tile_size,
+            args.threshold_mode, args.high_percentile, args.low_ratio,
+            args.low_threshold, args.high_threshold,
+        )
+
+    cp.cuda.Stream.null.synchronize()
+    end = time.perf_counter()
+
+    return (end - start) / args.runs, nms_cpu, edges_cpu, low, high
+
+
 def benchmark_gpu_frontend(
     image_cpu: np.ndarray,
     kernel_cpu: np.ndarray,
@@ -416,55 +493,51 @@ def main():
     best_result = None
 
     for tile_size in tile_sizes:
-        (
-            gpu_time,
-            gpu_nms,
-            gpu_edges,
-            gpu_low,
-            gpu_high,
-        ) = benchmark_gpu_frontend(
-            image_cpu,
-            kernel_cpu,
-            tile_size,
-            args,
+        gpu_hybrid_time, gpu_nms, gpu_hybrid_edges, gpu_low, gpu_high = benchmark_gpu_frontend(
+            image_cpu, kernel_cpu, tile_size, args,
+        )
+        gpu_full_time, _, gpu_full_edges, gf_low, gf_high = benchmark_gpu_full(
+            image_cpu, kernel_cpu, tile_size, args,
         )
 
         nms_max_abs_diff = float(np.max(np.abs(cpu_nms - gpu_nms)))
-        different_pixels = int(np.count_nonzero(cpu_edges != gpu_edges))
-        different_pixel_ratio = different_pixels / cpu_edges.size
+        diff_hybrid = int(np.count_nonzero(cpu_edges != gpu_hybrid_edges))
+        diff_full   = int(np.count_nonzero(cpu_edges != gpu_full_edges))
 
         result = {
             "tile_size": tile_size,
             "cpu_time_seconds": cpu_time,
-            "gpu_frontend_cpu_postprocess_seconds": gpu_time,
-            "speedup": cpu_time / gpu_time if gpu_time > 0 else float("inf"),
+            "gpu_frontend_cpu_postprocess_seconds": gpu_hybrid_time,
+            "gpu_full_seconds": gpu_full_time,
+            "speedup": cpu_time / gpu_hybrid_time if gpu_hybrid_time > 0 else float("inf"),
+            "speedup_full_gpu": cpu_time / gpu_full_time if gpu_full_time > 0 else float("inf"),
             "cpu_low_threshold": cpu_low,
             "cpu_high_threshold": cpu_high,
             "gpu_low_threshold": gpu_low,
             "gpu_high_threshold": gpu_high,
             "nms_max_abs_diff": nms_max_abs_diff,
-            "different_pixels": different_pixels,
-            "different_pixel_ratio": different_pixel_ratio,
-            "gpu_edges": gpu_edges,
+            "different_pixels": diff_hybrid,
+            "different_pixel_ratio": diff_hybrid / cpu_edges.size,
+            "different_pixels_full_gpu": diff_full,
+            "different_pixel_ratio_full_gpu": diff_full / cpu_edges.size,
+            "gpu_hybrid_edges": gpu_hybrid_edges,
+            "gpu_full_edges": gpu_full_edges,
         }
 
         results.append(result)
 
-        if best_result is None or gpu_time < best_result["gpu_frontend_cpu_postprocess_seconds"]:
+        if best_result is None or gpu_full_time < best_result["gpu_full_seconds"]:
             best_result = result
 
-    output_tag = make_output_tag(
-        image_path,
-        args.kernel_size,
-        args.sigma,
-        args.threshold_mode,
-    )
+    output_tag = make_output_tag(image_path, args.kernel_size, args.sigma, args.threshold_mode)
 
     csv_output_path = output_dir / f"22_complete_canny_benchmark_{output_tag}.csv"
     cpu_edge_output_path = output_dir / f"23_complete_canny_cpu_edges_{output_tag}.png"
-    gpu_edge_output_path = (
-        output_dir
-        / f"24_complete_canny_gpu_edges_{output_tag}_tile{best_result['tile_size']}.png"
+    gpu_hybrid_edge_output_path = (
+        output_dir / f"24_complete_canny_gpu_edges_{output_tag}_tile{best_result['tile_size']}.png"
+    )
+    gpu_full_edge_output_path = (
+        output_dir / f"24b_complete_canny_gpu_full_edges_{output_tag}_tile{best_result['tile_size']}.png"
     )
 
     with csv_output_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -474,7 +547,9 @@ def main():
                 "tile_size",
                 "cpu_time_seconds",
                 "gpu_frontend_cpu_postprocess_seconds",
+                "gpu_full_seconds",
                 "speedup",
+                "speedup_full_gpu",
                 "cpu_low_threshold",
                 "cpu_high_threshold",
                 "gpu_low_threshold",
@@ -482,59 +557,58 @@ def main():
                 "nms_max_abs_diff",
                 "different_pixels",
                 "different_pixel_ratio",
+                "different_pixels_full_gpu",
+                "different_pixel_ratio_full_gpu",
             ],
         )
-
         writer.writeheader()
-
         for result in results:
-            writer.writerow(
-                {
-                    "tile_size": result["tile_size"],
-                    "cpu_time_seconds": f"{result['cpu_time_seconds']:.8f}",
-                    "gpu_frontend_cpu_postprocess_seconds": (
-                        f"{result['gpu_frontend_cpu_postprocess_seconds']:.8f}"
-                    ),
-                    "speedup": f"{result['speedup']:.4f}",
-                    "cpu_low_threshold": f"{result['cpu_low_threshold']:.8f}",
-                    "cpu_high_threshold": f"{result['cpu_high_threshold']:.8f}",
-                    "gpu_low_threshold": f"{result['gpu_low_threshold']:.8f}",
-                    "gpu_high_threshold": f"{result['gpu_high_threshold']:.8f}",
-                    "nms_max_abs_diff": f"{result['nms_max_abs_diff']:.8f}",
-                    "different_pixels": result["different_pixels"],
-                    "different_pixel_ratio": f"{result['different_pixel_ratio']:.8f}",
-                }
-            )
+            writer.writerow({
+                "tile_size": result["tile_size"],
+                "cpu_time_seconds": f"{result['cpu_time_seconds']:.8f}",
+                "gpu_frontend_cpu_postprocess_seconds": f"{result['gpu_frontend_cpu_postprocess_seconds']:.8f}",
+                "gpu_full_seconds": f"{result['gpu_full_seconds']:.8f}",
+                "speedup": f"{result['speedup']:.4f}",
+                "speedup_full_gpu": f"{result['speedup_full_gpu']:.4f}",
+                "cpu_low_threshold": f"{result['cpu_low_threshold']:.8f}",
+                "cpu_high_threshold": f"{result['cpu_high_threshold']:.8f}",
+                "gpu_low_threshold": f"{result['gpu_low_threshold']:.8f}",
+                "gpu_high_threshold": f"{result['gpu_high_threshold']:.8f}",
+                "nms_max_abs_diff": f"{result['nms_max_abs_diff']:.8f}",
+                "different_pixels": result["different_pixels"],
+                "different_pixel_ratio": f"{result['different_pixel_ratio']:.8f}",
+                "different_pixels_full_gpu": result["different_pixels_full_gpu"],
+                "different_pixel_ratio_full_gpu": f"{result['different_pixel_ratio_full_gpu']:.8f}",
+            })
 
     save_edge_image(cpu_edge_output_path, cpu_edges)
-    save_edge_image(gpu_edge_output_path, best_result["gpu_edges"])
+    save_edge_image(gpu_hybrid_edge_output_path, best_result["gpu_hybrid_edges"])
+    save_edge_image(gpu_full_edge_output_path, best_result["gpu_full_edges"])
 
     print()
-    print("Complete Canny prototype benchmark results")
-    print("-----------------------------------------")
-    print(f"CPU full Canny time: {cpu_time:.6f} seconds")
-
+    print("Complete Canny benchmark results (3-way comparison)")
+    print("----------------------------------------------------")
+    print(f"CPU full Canny time: {cpu_time * 1000:.2f} ms")
+    print()
+    print(f"{'Tile':>5} | {'Hybrid(ms)':>10} | {'Speedup':>8} | {'Full GPU(ms)':>12} | {'Speedup':>8} | {'NMS diff':>9} | {'Edge diff%':>10}")
+    print("-" * 85)
     for result in results:
         print(
-            f"tile_size={result['tile_size']:>4} | "
-            f"GPU frontend + CPU postprocess={result['gpu_frontend_cpu_postprocess_seconds']:.6f}s | "
-            f"speedup={result['speedup']:.2f}x | "
-            f"NMS max diff={result['nms_max_abs_diff']:.6f} | "
-            f"different edge pixels={result['different_pixel_ratio'] * 100:.4f}%"
+            f"{result['tile_size']:>5} | "
+            f"{result['gpu_frontend_cpu_postprocess_seconds']*1000:>10.2f} | "
+            f"{result['speedup']:>8.2f}x | "
+            f"{result['gpu_full_seconds']*1000:>12.2f} | "
+            f"{result['speedup_full_gpu']:>8.2f}x | "
+            f"{result['nms_max_abs_diff']:>9.6f} | "
+            f"{result['different_pixel_ratio_full_gpu']*100:>10.4f}%"
         )
 
     print()
-    print(f"Best tile size: {best_result['tile_size']}")
+    print(f"Best tile size (full GPU): {best_result['tile_size']}")
     print(f"CSV results saved to: {csv_output_path}")
     print(f"CPU edge image saved to: {cpu_edge_output_path}")
-    print(f"Best GPU edge image saved to: {gpu_edge_output_path}")
-
-    print()
-    print(
-        "Note: this is a full Canny prototype. The frontend uses GPU/cuTile, "
-        "while double threshold and hysteresis are currently CPU post-processing "
-        "steps. This is suitable for integration with a later GPU hysteresis implementation."
-    )
+    print(f"Best hybrid GPU edge image saved to: {gpu_hybrid_edge_output_path}")
+    print(f"Best full GPU edge image saved to: {gpu_full_edge_output_path}")
 
 
 if __name__ == "__main__":
